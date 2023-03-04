@@ -1,0 +1,73 @@
+0001   0000             ; -----------------------------------------------------------------------------
+0002   0000             ; Ping-pong blinkenlight scroll example (Z80)
+0003   0000             ; Illuminates the LEDs of the blinkenlights port in sequence, back and forth, forever.
+0004   0000             ; Great for automotive grille lighting effects in 1980s TV shows.
+0005   0000             ; kmm 2020, public domain
+0006   0000             ; -----------------------------------------------------------------------------
+0007   0000             
+0008   0000             ; -----------------------------------------------------------------------------
+0009   0000             ; Macro Parameters
+0010   0000             ; These are similar to C #defines, in that they're symbolic representations
+0011   0000             ; of constants and make the code easier to read/modify. The Z80 will never
+0012   0000             ; see "STACKTOP", just the 0x2040 that gets inserted by the assembler in its place.
+0013   0000             ; -----------------------------------------------------------------------------
+0014   0000             STACKTOP 	.equ 2040h			; RAM starts at 0x2000, put the stack 64 bytes above
+0015   0000             BLPORTADDR	.equ 40h			; Blinkenlights are latched by an IO write with A6 active
+0016   0000             DELAYTIME	.equ 24000			; Sets the speed of the scroll, at 4.6MHz this is around 250ms to my eye
+0017   0000             DIRECTION	.equ STACKTOP + 1	; Memory location to store the current direction.
+0018   0000             								; The Z80 stack grows downwards so we can put this right above it in memory.
+0019   0000             
+0020   0000             ; -----------------------------------------------------------------------------
+0021   0000             ; Initialization
+0022   0000             ; -----------------------------------------------------------------------------
+0023   0000             start .org 0000h				; Locate this code at the reset vector address, 0x0000
+0024   0000 31 40 20    	ld sp, STACKTOP				; Set up the stack pointer by loading STACKTOP into the SP register
+0025   0003 3E 00       	ld a, 0						; Load 0 in A to initialize the direction value with
+0026   0005 32 41 20    	ld (DIRECTION), a			; Save it to memory at the location defined by DIRECTION (0x2041)
+0027   0008 1E 01       	ld e, 1						; E will be where we store the bit pattern, set a 1 a the LSB position
+0028   000A 3E FF       	ld a, 00ffh					; Lamp test at start up, illuminate all the blinkenlights
+0029   000C D3 40       	out (BLPORTADDR), a			; Write it to the blinkenlights port
+0030   000E 01 80 BB    	ld bc, 48000				; Load delay value into BC, the delay subroutine will pick this up
+0031   0011 CD 46 00    	call delay					; Call the delay subroutine to wait a little bit with all the LEDs illuminated
+0032   0014             
+0033   0014             ; -----------------------------------------------------------------------------
+0034   0014             ; Main Loop
+0035   0014             ; -----------------------------------------------------------------------------
+0036   0014             loop:							; This is a label, another assembler convenience.
+0037   0014 7B          	ld a, e						; Load E into A
+0038   0015 D3 40       	out (BLPORTADDR), a			; Write it to the blinkenlatch
+0039   0017 3A 41 20    	ld a, (DIRECTION)			; Load the value of DIRECTION into A
+0040   001A FE 00       	cp 0						; Is it zero?
+0041   001C 20 14       	jr nz, roll_down			; If not jump to roll_down
+0042   001E             roll_up:						; Otherwise, roll_up
+0043   001E CB 03       	rlc e						; Rotate the bits in E left
+0044   0020 01 C0 5D    	ld bc, DELAYTIME			; Wait for it
+0045   0023 CD 46 00    	call delay					; ...
+0046   0026 7B          	ld a, e						; Load E into A
+0047   0027 FE 80       	cp 80h						; Is bit 7 (MSB) in A set?
+0048   0029 20 E9       	jr nz, loop					; If not, start over and continue rotating in this direction
+0049   002B 3E 01       	ld a, 1						; If so, set the DIRECTION flag to 1
+0050   002D 32 41 20    	ld (DIRECTION), a			; ...
+0051   0030 18 E2       	jr loop						; And continue from the top
+0052   0032             roll_down:						; We get here if DIRECTION == 1
+0053   0032 CB 0B       	rrc e						; Rotate the bits in E right
+0054   0034 01 C0 5D    	ld bc, DELAYTIME			; Wait for it
+0055   0037 CD 46 00    	call delay					; ...
+0056   003A 7B          	ld a, e						; Load E into A
+0057   003B FE 01       	cp 1h						; Is bit 0 in A set?
+0058   003D 20 D5       	jr nz, loop					; If not, continue rotating in this direction
+0059   003F 3E 00       	ld a, 0						; If so, set the DIRECTION flag to 0
+0060   0041 32 41 20    	ld (DIRECTION), a			; ...
+0061   0044 18 CE       	jr loop						; And continue from the top
+0062   0046             
+0063   0046             ; -----------------------------------------------------------------------------
+0064   0046             ; Delay Subroutine
+0065   0046             ; Load number of loops (16 bit, up to 65,535) to delay into BC and call this.
+0066   0046             ; -----------------------------------------------------------------------------
+0067   0046             delay:
+0068   0046 0B          	dec bc						; Decrement BC
+0069   0047 78          	ld a, b						; Load B into A
+0070   0048 B1          	or c						; OR it with C, if the result is zero the 'or' instruction sets the Z flag
+0071   0049 20 FB       	jr nz, delay				; If it's not zero loop back to the start of the subroutine
+0072   004B C9          	ret							; If so, we're done delaying
+0073   004C             .endtasm: Number of errors = 0

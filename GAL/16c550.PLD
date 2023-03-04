@@ -1,0 +1,28 @@
+Name     LCD ;
+PartNo   00 ;
+Date     4/14/2020 ;
+Revision 01 ;
+Designer Engineer ;
+Company  sdfasdfsdf ;
+Assembly None ;
+Location  ;
+Device   g20v8a;
+
+/* *************** INPUT PINS *********************/
+PIN 2 = A3    ; 
+PIN 3 = !WR   ;
+PIN 4 = !RD   ;
+PIN 5 = !SRST ;
+
+/* *************** OUTPUT PINS *********************/
+PIN 22 = !CS  ;
+PIN 21 = !AS  ;
+PIN 20 = !URD ;
+PIN 19 = !UWR ;
+PIN 18 = URST ;
+
+CS = A3       ;
+AS = A3       ;
+UWR = A3 & WR ;
+URD = A3 & RD ;
+URST = SRST   ;

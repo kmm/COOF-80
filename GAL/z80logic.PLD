@@ -1,0 +1,44 @@
+Name     z80logic ;
+PartNo   00 ;
+Date     4/5/2020 ;
+Revision 01 ;
+Designer Engineer ;
+Company  sdfasdfsdf ;
+Assembly None ;
+Location  ;
+Device   g22v10 ;
+
+/* *************** INPUT PINS *********************/
+PIN 2    =  !RD                       ; /*                                 */ 
+PIN 3    =  !WR                       ; /*                                 */ 
+PIN 4    =  !MEMRQ                    ; /*                                 */ 
+PIN 5    =  !IORQ                     ; /*                                 */ 
+PIN 6    =  !M1                       ; /*                                 */ 
+PIN 7    =  A13                       ; /*                                 */ 
+PIN 8    =  A14                       ; /*                                 */ 
+PIN 9    =  A15                       ; /*                                 */ 
+PIN 10   =  A6 ;
+/* *************** OUTPUT PINS *********************/
+PIN 23    = !MEMRD                    ; /*                                 */ 
+PIN 22    = !MEMWR                    ; /*                                 */ 
+PIN 21    = !IORD                     ; /*                                 */ 
+PIN 20    = !IOWR                     ; /*                                 */ 
+PIN 19    = !CSROM                    ; /*                                 */ 
+PIN 18    = !CSRAM0                   ; /*                                 */ 
+PIN 17    = !CSRAM1                   ; /*                                 */ 
+PIN 16    = !CSRAM2                   ; /*                                 */ 
+PIN 15    = !INTACK			    ;
+PIN 14    = BLLATCH ;
+CSROM  = MEMRQ & !A13 & !A14 & !A15 ;
+CSRAM0 = MEMRQ &  A13 & !A14 & !A15 ; 
+CSRAM1 = MEMRQ & !A13 &  A14 & !A15 ;
+CSRAM2 = MEMRQ &  A13 &  A14 & !A15 ;
+
+IORD  = IORQ & !MEMRQ & RD & !WR ;
+IOWR  = IORQ & !MEMRQ & !RD & WR ;
+MEMRD = !IORQ & MEMRQ & RD & !WR ;
+MEMWR = !IORQ & MEMRQ & !RD & WR ;
+
+INTACK = IORQ & M1 ;
+
+BLLATCH = IORQ & !MEMRQ & !RD & WR & A6;

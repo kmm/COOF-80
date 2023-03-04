@@ -1,0 +1,1859 @@
+0001   0000             ; COOFMON-Z80
+0002   0000             ; -----------------------------------------------------------------------------
+0003   0000             ; A simple ROM monitor for a simple Z80 computer, written during the first 
+0004   0000             ; weeks of lockdown for the unknown pathogen of unspecified origin in 1Q2020.
+0005   0000             ; (c) kmm 2020, MIT license
+0006   0000             ; -----------------------------------------------------------------------------
+0007   0000             ; CLI Commands
+0008   0000             ; d[ump] <hexaddr> <hexlen>
+0009   0000             ;	Dump <hexlen> bytes memory starting at <hexaddr>
+0010   0000             ; x[ecute] <hexaddr>
+0011   0000             ;	Jump to <hexaddr> and execute
+0012   0000             ; c[all] <hexaddr>
+0013   0000             ;	Call <hexaddr> and return to monitor
+0014   0000             ; f[ill] <hexaddr> <hexlen> <hexval>
+0015   0000             ;	Fill <hexlen> bytes starting at <hexaddr> with <hexval>
+0016   0000             ; :ihxstring
+0017   0000             ;	Load Intel hex string into memory
+0018   0000             ; w[rite] <hexval> <hexaddr>
+0019   0000             ;	Write <hexval> to memory location <hexaddr>
+0020   0000             ; i[nput] <hexport>
+0021   0000             ;	Read <hexport> and print the value (high order byte ignored)
+0022   0000             ; o[utput] <hexport> <hexval>
+0023   0000             ;	Write <hexval> to <hexport> (high order byte ignored)
+0024   0000             ; -----------------------------------------------------------------------------
+0025   0000             ; Also provides some "BIOS" type interrupt utility routines that can be 
+0026   0000             ; used by other code. Refer to implementations for more details.
+0027   0000             ; API call IDs:
+0028   0000             ; 	0x00 - NOP
+0029   0000             ; 	0x01 - Get character from UART, returned in A
+0030   0000             ;	0x02 - Send character in A to UART
+0031   0000             ;	0x03 - Send zero-terminated string pointed to by HL to UART
+0032   0000             ;	0x04 - Split rxbuf and place in argbuf
+0033   0000             ;	0x05 - Convert byte in A to ASCII hex, leave two chars in HL
+0034   0000             ;	0x06 - Convert two ASCII chars in HL to byte, leave byte in A
+0035   0000             ;	0x07 - Delay number of loops specified by HL
+0036   0000             ;	0x08 - Get argbuf address and return it in HL
+0037   0000             ;	0x09 - Get rxbuf address and return it in HL
+0038   0000             ;	0x0A - Get substring from argbuf
+0039   0000             ; Calling convention:
+0040   0000             ; 	- Push call number on stack
+0041   0000             ;	- Load registers as appropriate for the API call being used
+0042   0000             ;	- Execute RST 08h
+0043   0000             
+0044   0000             ; UART Parameters
+0045   0000             BAUDRATE			.equ 9600					; console baud rate
+0046   0000             UARTCLK				.equ 4000000				; 16C550 crystal frequency
+0047   0000             ; Program Constants
+0048   0000             STACKTOP			.equ 2040h 					; set stack pointer to 64 bytes above rom end
+0049   0000             RXBUFLEN			.equ 160
+0050   0000             TXBUFLEN			.equ 32
+0051   0000             ARGBUFLEN			.equ 160
+0052   0000             ; Argument indexes, mostly for clarity in code
+0053   0000             IDX_CMD				.equ 0
+0054   0000             IDX_ARG_1			.equ 1
+0055   0000             IDX_ARG_2			.equ 2
+0056   0000             IDX_ARG_3			.equ 3
+0057   0000             IDX_ARG_4			.equ 4
+0058   0000             ; UART ports and registers
+0059   0000~            #ifdef ZEMU
+0060   0000~            UART_BASE			.equ 20h					; Simulated UART starts at IO address 0x20 in ZEMU
+0061   0000~            UART_LSR			.equ UART_BASE+1
+0062   0000             #else
+0063   0000             UART_BASE			.equ 08h					; 16C550 starts at 0x08 in real hardware
+0064   0000             UART_LSR			.equ UART_BASE+5
+0065   0000             #endif
+0066   0000             UART_RHR			.equ UART_BASE				; rx holding register
+0067   0000             UART_THR			.equ UART_BASE				; tx holding register
+0068   0000             UART_IER			.equ UART_BASE + 1			; interrupt enable register
+0069   0000             UART_FCR			.equ UART_BASE + 2			; fifo control register
+0070   0000             UART_ISR			.equ UART_BASE + 2			; interrupt status register
+0071   0000             UART_LCR			.equ UART_BASE + 3			; line control register
+0072   0000             UART_MCR			.equ UART_BASE + 4			; modem control register
+0073   0000             UART_MSR			.equ UART_BASE + 6			; modem status register
+0074   0000             UART_SPR			.equ UART_BASE + 7			; scratchpad register
+0075   0000             UART_BDL			.equ UART_BASE				; baud rate divisor low byte at base + 0 (with lcr bit 7 set)
+0076   0000             UART_BDH			.equ UART_BASE + 1			; baud rate divisor low byte at base + 1 (with lcr bit 7 set)
+0077   0000             
+0078   0000             UART_LCR_bit_dle	.equ 80h					; lcr bit 7, divisor latch enable
+0079   0000             UART_LCR_bit_brk	.equ 40h					; lcr bit 6, set break mode
+0080   0000             UART_LCR_bit_sp		.equ 20h					; lcr bit 5, set parity
+0081   0000             UART_LCR_bit_ep		.equ 10h					; lcr bit 4, even parity
+0082   0000             UART_LCR_bit_pe		.equ 8h						; lcr bit 3, parity enable 
+0083   0000             UART_LCR_bit_sb		.equ 4h						; lcr bit 2, stop bit length (0: 1, 1: 2)
+0084   0000             UART_LCR_5b			.equ 0h						; lcr bits 0 and 1, 5 bits
+0085   0000             UART_LCR_6b			.equ 1h						; lcr bits 0 and 1, 6 bits
+0086   0000             UART_LCR_7b			.equ 2h						; lcr bits 0 and 1, 7 bits
+0087   0000             UART_LCR_8b			.equ 3h						; lcr bits 0 and 1, 8 bits
+0088   0000             
+0089   0000             UART_LSR_bit_txe	.equ 6						; lsr bit 6, tx holding register and shift register empty
+0090   0000             UART_LSR_bit_thre	.equ 5						; lsr bit 5, tx holding register empty
+0091   0000             UART_LSR_bit_rxr	.equ 0						; lsr bit 0, rx data ready
+0092   0000             
+0093   0000             uart_con_baudl		.equ UARTCLK/(16*BAUDRATE)	; baud rate divisor [uart clock / (16 * baud rate)]
+0094   0000             uart_con_baudh		.equ 00h					; high byte not used
+0095   0000             
+0096   0000             uart_con_lcr		.equ UART_LCR_8b			; 8, n, 1
+0097   0000             
+0098   0000             ; Static allocations
+0099   0000             v_rxbuf				.equ STACKTOP+1	     		; 160 byte rx buffer
+0100   0000             v_rxbufpos			.equ v_rxbuf+RXBUFLEN+1		; 1 byte rx buffer pointer
+0101   0000             v_txbuf				.equ v_rxbufpos+1   		; 32 byte tx buffer
+0102   0000             v_txbufpos			.equ v_txbuf+TXBUFLEN+1		; 1 byte tx buffer pointer
+0103   0000             v_argbufpos   		.equ v_txbufpos+1			; the current position in the buffer
+0104   0000             v_argcount    		.equ v_argbufpos+1			; the number of arguments found
+0105   0000             v_argbuf      		.equ v_argcount+1			; the buffer that will hold the arguments
+0106   0000             v_dump_start		.equ v_argbuf+1				; dump start variable (16 bit)
+0107   0000             v_dump_length		.equ v_dump_start+2			; dump length variable (16 bit)
+0108   0000             v_scratch			.equ v_dump_length+2		; scratch buffer
+0109   0000             
+0110   0000             ; Startup vector
+0111   0000             start:	.org 0000h
+0112   0000 C3 7F 00    	jp init
+0113   0003             ; Interrupt vectors
+0114   0008             int8:	.org 0008h								; vector for INT 8 API calls
+0115   0008 C3 C3 00    	jp int8_handler
+0116   000B             ; Main code start
+0117   007F             init: .org 007Fh
+0118   007F 31 40 20    	ld sp, STACKTOP								; set stack pointer
+0119   0082 CD 64 05    	call uart_init								; init uart
+0120   0085 21 B0 05    	ld hl, ansi_csi_clear
+0121   0088 CD 75 05    	call uart_putstr
+0122   008B 21 B5 05    	ld hl, ansi_csi_home
+0123   008E CD 75 05    	call uart_putstr
+0124   0091 21 04 06    	ld hl, ansi_bg_blue
+0125   0094 CD 75 05    	call uart_putstr
+0126   0097 21 CE 05    	ld hl, ansi_fg_yellow
+0127   009A CD 75 05    	call uart_putstr
+0128   009D 21 23 06    	ld hl, hello								; load address of string into hl (arg for uart_txstr)
+0129   00A0 CD 75 05        call uart_putstr							; send it
+0130   00A3 21 EC 05    	ld hl, ansi_bg_black
+0131   00A6 CD 75 05    	call uart_putstr
+0132   00A9 21 E6 05    	ld hl, ansi_fg_white
+0133   00AC CD 75 05    	call uart_putstr	
+0134   00AF 21 1C 06    	ld hl, crlf									; send a CRLF
+0135   00B2 CD 75 05    	call uart_putstr
+0136   00B5 21 3B 06    	ld hl, prompt								; send a prompt
+0137   00B8 CD 75 05    	call uart_putstr
+0138   00BB 3E 00       	ld a, 0
+0139   00BD 32 E2 20    	ld (v_rxbufpos), a							; initialize the RX buffer position
+0140   00C0 C3 1C 01    	jp mainloop
+0141   00C3             
+0142   00C3             ; This exposes some handy routines for use by other code loaded by
+0143   00C3             ; the monitor. Think DOS's INT 21h API.
+0144   00C3             ;
+0145   00C3             ; API call IDs:
+0146   00C3             ; 	0x00 - NOP
+0147   00C3             ; 	0x01 - Get character from UART, returned in A
+0148   00C3             ;	0x02 - Send character in A to UART
+0149   00C3             ;	0x03 - Send zero-terminated string pointed to by HL to UART
+0150   00C3             ;	0x04 - Split rxbuf and place in argbuf
+0151   00C3             ;	0x05 - Convert byte in A to ASCII hex, leave two chars in HL
+0152   00C3             ;	0x06 - Convert two ASCII chars in HL to byte, leave byte in A
+0153   00C3             ;	0x07 - Delay number of loops specified by HL
+0154   00C3             ;	0x08 - Get argbuf address and return it in HL
+0155   00C3             ;	0x09 - Get rxbuf address and return it in HL
+0156   00C3             ;	0x0A - Get substring from argbuf
+0157   00C3             ; Calling convention:
+0158   00C3             ; 	- Push call number on stack
+0159   00C3             ;	- Load registers as appropriate for the API call being used
+0160   00C3             ;	- Execute RST 08h
+0161   00C3             int8_handler:						; handler for INT 8 API calls
+0162   00C3 FD E1       	pop iy							; save return address in IY
+0163   00C5 08          	ex af, af'						; swap in shadow register A
+0164   00C6 F1          	pop af							; pop the API call number into A
+0165   00C7 FD E5       	push iy							; push the return address back on the stack
+0166   00C9 FE 01       	cp 01h							; jump to requested routine
+0167   00CB 28 25       	jr z, int8_getch
+0168   00CD FE 02       	cp 02h 
+0169   00CF 28 25       	jr z, int8_putch
+0170   00D1 FE 03       	cp 03h
+0171   00D3 28 25       	jr z, int8_putstr
+0172   00D5 FE 04       	cp 04h
+0173   00D7 28 25       	jr z, int8_split
+0174   00D9 FE 05       	cp 05h
+0175   00DB 28 25       	jr z, int8_byte_to_ahex
+0176   00DD FE 06       	cp 06h
+0177   00DF 28 25       	jr z, int8_ahex_to_byte
+0178   00E1 FE 07       	cp 07h
+0179   00E3 28 25       	jr z, int8_delay
+0180   00E5 FE 08       	cp 08h
+0181   00E7 28 25       	jr z, int8_get_argbuf_ptr
+0182   00E9 FE 09       	cp 09h
+0183   00EB 28 26       	jr z, int8_get_rxbuf_ptr
+0184   00ED FE 0A       	cp 0ah
+0185   00EF 28 27       	jr z, int8_get_substr
+0186   00F1 C9          	ret								; return if no match
+0187   00F2             int8_getch:
+0188   00F2 08          	ex af, af' 						; swap out shadow register A
+0189   00F3 C3 99 05    	jp uart_getch					; jump to routine, return address was already pushed by RST
+0190   00F6             int8_putch:
+0191   00F6 08          	ex af, af'						
+0192   00F7 C3 87 05    	jp uart_putch
+0193   00FA             int8_putstr:
+0194   00FA 08          	ex af, af'						
+0195   00FB C3 75 05    	jp uart_putstr
+0196   00FE             int8_split:
+0197   00FE 08          	ex af, af'
+0198   00FF C3 88 04    	jp split
+0199   0102             int8_byte_to_ahex:
+0200   0102 08          	ex af, af'
+0201   0103 C3 2A 05    	jp byte_to_ahex
+0202   0106             int8_ahex_to_byte:
+0203   0106 08          	ex af, af'
+0204   0107 C3 12 05    	jp ahex_to_byte
+0205   010A             int8_delay:
+0206   010A 08          	ex af, af'
+0207   010B C3 AA 05    	jp delay
+0208   010E             int8_get_argbuf_ptr:
+0209   010E 08          	ex af, af'
+0210   010F 21 07 21    	ld hl, v_argbuf
+0211   0112 C9          	ret
+0212   0113             int8_get_rxbuf_ptr:
+0213   0113 08          	ex af, af'
+0214   0114 21 41 20    	ld hl, v_rxbuf
+0215   0117 C9          	ret
+0216   0118             int8_get_substr:
+0217   0118 08          	ex af, af'
+0218   0119 C3 E1 04    	jp get_substr
+0219   011C             
+0220   011C             ; Commands
+0221   011C             ;
+0222   011C             ; Numeric arguments all in hex
+0223   011C             ;
+0224   011C             ; Dump memory hex
+0225   011C             ; d [addr] [length]
+0226   011C             ;
+0227   011C             ; Load Intel Hex string into memory
+0228   011C             ; :IHXSTRING
+0229   011C             ; 
+0230   011C             ; Execute (jump to addr)
+0231   011C             ; x [addr]
+0232   011C             ;
+0233   011C             ; Write memory (1 byte)
+0234   011C             ; w [addr] [value]
+0235   011C             ;
+0236   011C             ; Fill memory
+0237   011C             ; f [addr] [value] [length]
+0238   011C             ;
+0239   011C             ; Test memory
+0240   011C             ; t [start-addr] [end-addr]
+0241   011C             ;
+0242   011C             ; Set blinkenlights
+0243   011C             ; b [value]
+0244   011C             ;
+0245   011C             mainloop:
+0246   011C CD 99 05    	call uart_getch					; read char from uart (blocking)
+0247   011F             									; handle some control characters
+0248   011F FE 0A       	cp 0Ah							; throw it away if it's a LF
+0249   0121 28 F9       	jr z, mainloop					; ...
+0250   0123 FE 0D       	cp 0Dh							; process command if it's a CR (enter key)
+0251   0125 28 5E       	jr z, ml_process				; ...
+0252   0127 FE 08       	cp 08h							; process backspace
+0253   0129 28 20       	jr z, ml_backspace				; ...
+0254   012B FE 0C       	cp 0Ch							; process ctrl-L (clear buffer)
+0255   012D 28 3A       	jr z, ml_clearbuf				; ...
+0256   012F             	
+0257   012F 57          	ld d, a							; otherwise save char in d
+0258   0130 21 41 20    	ld hl, v_rxbuf					; load RX buffer address in hl
+0259   0133 3A E2 20    	ld a, (v_rxbufpos)				; load RX buffer position
+0260   0136 CD 5E 05    	call add_a_hl                   ; add RX buffer position to hl
+0261   0139 7A          	ld a, d							; copy inputted char from d to a
+0262   013A 77          	ld (hl), a                      ; save inputted char to RX buf
+0263   013B 3A E2 20    	ld a, (v_rxbufpos)				; load buffer position into a
+0264   013E 3C          	inc a                           ; increment RX buf position
+0265   013F 32 E2 20    	ld (v_rxbufpos), a				; save RX buf position
+0266   0142 23          	inc hl							; increment RX buf position
+0267   0143 36 00       	ld (hl), 0                      ; zero terminate
+0268   0145 7A          	ld a, d							; load d (input char) into a
+0269   0146 CD 87 05    	call uart_putch					; echo back character in a
+0270   0149 18 D1       	jr mainloop						; continue looping
+0271   014B             	
+0272   014B             ml_backspace:
+0273   014B 3A E2 20    	ld a, (v_rxbufpos)				; load buffer position
+0274   014E FE 00       	cp 0							; if it's already zero just return
+0275   0150 28 CA       	jr z, mainloop					; ...
+0276   0152             	
+0277   0152 21 1F 06    	ld hl, termbs					; send terminal backspace sequence
+0278   0155 CD 75 05    	call uart_putstr				; ...
+0279   0158             	
+0280   0158 3A E2 20    	ld a, (v_rxbufpos)				; load buffer position	
+0281   015B 3D          	dec a							; decrement it
+0282   015C 32 E2 20    	ld (v_rxbufpos), a				; save it
+0283   015F 21 41 20    	ld hl, v_rxbuf					; load rx buffer pointer
+0284   0162 CD 5E 05    	call add_a_hl					; add position to it
+0285   0165 36 00       	ld (hl), 0						; zero terminate it
+0286   0167 18 B3       	jr mainloop						; start the loop again
+0287   0169             
+0288   0169             ml_clearbuf:
+0289   0169 21 E2 20    	ld hl, v_rxbufpos				; zero bufpos
+0290   016C 36 00       	ld (hl), 0						; ...
+0291   016E 21 41 20    	ld hl, v_rxbuf					; zero terminate input buffer
+0292   0171 36 00       	ld (hl), 0						; ...
+0293   0173 21 B0 05    	ld hl, ansi_csi_clear			; clear the screen
+0294   0176 CD 75 05    	call uart_putstr				; ...
+0295   0179 21 B5 05    	ld hl, ansi_csi_home			; home the cursor
+0296   017C CD 75 05    	call uart_putstr				; ...
+0297   017F CD 05 05    	call display_prompt				; display the prompt
+0298   0182 C3 1C 01    	jp mainloop						; start the loop again
+0299   0185             
+0300   0185             ml_process:
+0301   0185 21 1C 06    	ld hl, crlf
+0302   0188 CD 75 05    	call uart_putstr
+0303   018B             	
+0304   018B 21 41 20    	ld hl, v_rxbuf					; split the input string
+0305   018E CD 88 04    	call split						; ...
+0306   0191             	
+0307   0191 3E 00       	ld a, IDX_CMD					; get first field
+0308   0193 CD E1 04    	call get_substr					; ...
+0309   0196             	
+0310   0196 7E          	ld a, (hl)						; load first char into a
+0311   0197             	
+0312   0197 FE 20       	cp 20h
+0313   0199 CA DB 01    	jp z, ml_prompt_restart
+0314   019C FE 00       	cp 0h
+0315   019E CA DB 01    	jp z, ml_prompt_restart
+0316   01A1 FE 78       	cp 'x'							
+0317   01A3 CA FE 01    	jp z, cmd_execute
+0318   01A6 FE 63       	cp 'c'
+0319   01A8 CA 0D 02    	jp z, cmd_call
+0320   01AB FE 64       	cp 'd'
+0321   01AD CA 30 02    	jp z, cmd_dump
+0322   01B0 FE 77       	cp 'w'
+0323   01B2 CA AD 02    	jp z, cmd_write
+0324   01B5 FE 3A       	cp ':'
+0325   01B7 CA CA 02    	jp z, cmd_loadihx
+0326   01BA FE 66       	cp 'f'
+0327   01BC CA 49 03    	jp z, cmd_fill
+0328   01BF FE 69       	cp 'i'
+0329   01C1 CA 79 03    	jp z, cmd_input
+0330   01C4 FE 6F       	cp 'o'
+0331   01C6 CA 91 03    	jp z, cmd_output
+0332   01C9 FE 72       	cp 'r'
+0333   01CB CA 22 02    	jp z, cmd_restart
+0334   01CE FE 68       	cp 'h'
+0335   01D0 CA AF 03    	jp z, cmd_help
+0336   01D3 FE 3F       	cp '?'
+0337   01D5 CA AF 03    	jp z, cmd_help	
+0338   01D8 C3 E9 01    	jp cmd_bad
+0339   01DB             	
+0340   01DB             ml_prompt_restart:
+0341   01DB 3E 00       	ld a, 0
+0342   01DD 32 E2 20    	ld (v_rxbufpos), a				; reset buffer position
+0343   01E0 32 41 20    	ld (v_rxbuf), a					; null terminate the head of the input buffer	
+0344   01E3 CD 05 05    	call display_prompt				; print prompt
+0345   01E6 C3 1C 01    	jp mainloop						; restart loop
+0346   01E9             
+0347   01E9             cmd_bad:
+0348   01E9 21 C2 05    	ld hl, ansi_fg_red
+0349   01EC CD 75 05    	call uart_putstr
+0350   01EF 21 5C 06    	ld hl, err_bad_command
+0351   01F2 CD 75 05    	call uart_putstr
+0352   01F5 21 E6 05    	ld hl, ansi_fg_white
+0353   01F8 CD 75 05    	call uart_putstr
+0354   01FB C3 DB 01    	jp ml_prompt_restart
+0355   01FE             
+0356   01FE             ; -----------------------------------------------------------------------------
+0357   01FE             ; Command: x <hexaddr>
+0358   01FE             ; 	Jump execution to <hexaddr>.
+0359   01FE             ; -----------------------------------------------------------------------------
+0360   01FE             cmd_execute:
+0361   01FE 3E 01       	ld a, IDX_ARG_1					; get address argument string pointer
+0362   0200 CD E1 04    	call get_substr					; ...
+0363   0203 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0364   0206 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0365   0209 E9          	jp (hl)
+0366   020A C3 1C 01    	jp mainloop
+0367   020D             
+0368   020D             ; -----------------------------------------------------------------------------
+0369   020D             ; Command: c <hexaddr>
+0370   020D             ; 	Call <hexaddr>.
+0371   020D             ; -----------------------------------------------------------------------------
+0372   020D             cmd_call:
+0373   020D 3E 01       	ld a, IDX_ARG_1					; get address argument string pointer
+0374   020F CD E1 04    	call get_substr					; ...
+0375   0212 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0376   0215 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0377   0218 FD 21 1F 02 	ld iy, $+7
+0378   021C FD E5       	push iy
+0379   021E E9          	jp (hl)
+0380   021F C3 DB 01    	jp ml_prompt_restart
+0381   0222             
+0382   0222             ; -----------------------------------------------------------------------------
+0383   0222             ; Command: r <hexaddr>
+0384   0222             ; 	Clears IX and IY, resets SP, jumps to (start)
+0385   0222             ; -----------------------------------------------------------------------------
+0386   0222             cmd_restart:
+0387   0222 DD 21 00 00 	ld ix, 0000h
+0388   0226 FD 21 00 00 	ld iy, 0000h
+0389   022A 31 40 20    	ld sp, STACKTOP
+0390   022D C3 00 00    	jp start
+0391   0230             	
+0392   0230             
+0393   0230             ; -----------------------------------------------------------------------------
+0394   0230             ; Command: d <hexaddr> <hexlen>
+0395   0230             ; 	Print <hexlen> bytes of memory starting at <hexaddr>.
+0396   0230             ; -----------------------------------------------------------------------------
+0397   0230             cmd_dump:
+0398   0230             	; get address argument
+0399   0230 3E 01       	ld a, IDX_ARG_1					; get address argument string pointer
+0400   0232 CD E1 04    	call get_substr					; ...
+0401   0235 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0402   0238 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0403   023B E5          	push hl							; load it into BC via the stack because get_str will smash IX next time we call it
+0404   023C C1          	pop bc							; ...
+0405   023D             									; get length argument
+0406   023D 3E 02       	ld a, IDX_ARG_2					; get length argument string pointer
+0407   023F CD E1 04    	call get_substr					; ...
+0408   0242 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0409   0245 CD B8 03    	call check_hexarg				; validate the argument	
+0410   0248 E5          	push hl							; load it into DE via the stack
+0411   0249 D1          	pop de							; ...
+0412   024A 7A          	ld a, d							; check for zero length
+0413   024B B3          	or e							; ...
+0414   024C 28 5C       	jr z, cmd_dump_end				; exit if so
+0415   024E C5          	push bc							; copy BC to IX
+0416   024F DD E1       	pop ix							
+0417   0251 01 00 00    	ld bc, 0						; zero out BC (position counter)
+0418   0254 18 06       	jr cmd_dump_start				; start dumping
+0419   0256             cmd_dump_start_line:
+0420   0256 21 1C 06    	ld hl, crlf						; print a newline
+0421   0259 CD 75 05    	call uart_putstr				; ...
+0422   025C             cmd_dump_start:
+0423   025C 21 E0 05    	ld hl, ansi_fg_cyan				; set fg color to cyan
+0424   025F CD 75 05    	call uart_putstr				; ...
+0425   0262 DD E5       	push ix							; copy IX to HL
+0426   0264 E1          	pop hl							; ...
+0427   0265 7C          	ld a, h							; convert H to ascii and print it
+0428   0266 CD 2A 05    	call byte_to_ahex				; ...
+0429   0269 CD 90 05    	call uart_put_hl				; ...
+0430   026C DD E5       	push ix							; copy IX to HL
+0431   026E E1          	pop hl							; ...
+0432   026F 7D          	ld a, l							; convert L to ascii and print it
+0433   0270 CD 2A 05    	call byte_to_ahex				; ...
+0434   0273 CD 90 05    	call uart_put_hl				; ...
+0435   0276 21 E6 05    	ld hl, ansi_fg_white			; set fg color to white
+0436   0279 CD 75 05    	call uart_putstr				; ...
+0437   027C 3E 20       	ld a, ' '						; print a space
+0438   027E CD 87 05    	call uart_putch					; ...
+0439   0281             cmd_dump_print:
+0440   0281 DD 7E 00    	ld a, (ix)						; load byte pointed to by IX
+0441   0284 CD 2A 05    	call byte_to_ahex				; convert it to two ASCII bytes (in HL)
+0442   0287 CD 90 05    	call uart_put_hl				; send the two characters in HL
+0443   028A DD 23       	inc ix							; increment pointer
+0444   028C             									; check for terminal condition
+0445   028C D5          	push de							; load DE into HL via the stack
+0446   028D E1          	pop hl							; ...
+0447   028E B7          	or a							; 16 bit compare HL [DE] and BC
+0448   028F ED 42       	sbc hl, bc						; ...
+0449   0291 09          	add hl, bc						; ...
+0450   0292 28 16       	jr z, cmd_dump_end				; exit routine
+0451   0294 03          	inc bc							; increment counter
+0452   0295 C5          	push bc
+0453   0296 D5          	push de
+0454   0297 16 10       	ld d, 10h
+0455   0299 CD 50 05    	call c_div_d
+0456   029C FE 00       	cp 0
+0457   029E D1          	pop de
+0458   029F C1          	pop bc
+0459   02A0 CA 56 02    	jp z, cmd_dump_start_line
+0460   02A3 3E 20       	ld a, ' '
+0461   02A5 CD 87 05    	call uart_putch
+0462   02A8 18 D7       	jr cmd_dump_print
+0463   02AA             cmd_dump_end:	
+0464   02AA C3 DB 01    	jp ml_prompt_restart
+0465   02AD             
+0466   02AD             ; -----------------------------------------------------------------------------
+0467   02AD             ; Command: w <hexaddr> <value>
+0468   02AD             ; 	Write low byte of <value> to memory at <hexaddr>.
+0469   02AD             ; -----------------------------------------------------------------------------
+0470   02AD             cmd_write:
+0471   02AD 3E 01       	ld a, IDX_ARG_1					; get address argument string pointer
+0472   02AF CD E1 04    	call get_substr					; ...
+0473   02B2 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0474   02B5 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0475   02B8 E5          	push hl							; load it into BC via the stack because get_str will smash IX next time we call it
+0476   02B9 C1          	pop bc							; ...
+0477   02BA             									; get length argument
+0478   02BA 3E 02       	ld a, IDX_ARG_2					; get length argument string pointer
+0479   02BC CD E1 04    	call get_substr					; ...
+0480   02BF CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0481   02C2 CD B8 03    	call check_hexarg				; validate the argument
+0482   02C5             	
+0483   02C5 7D          	ld a, l
+0484   02C6 02          	ld (bc), a
+0485   02C7 C3 DB 01    	jp ml_prompt_restart
+0486   02CA             
+0487   02CA             ; -----------------------------------------------------------------------------
+0488   02CA             ; Command: <intel hex string>
+0489   02CA             ; 	Write <intel hex string> to memory as specified in the string
+0490   02CA             ; -----------------------------------------------------------------------------	
+0491   02CA             cmd_loadihx:
+0492   02CA DD 21 41 20 	ld ix, v_rxbuf					; load IX with base of input buf
+0493   02CE DD 46 00    	ld b, (ix)						
+0494   02D1 DD 23       	inc ix
+0495   02D3 DD 66 06    	ld h, (ix+6)					; load the record type high nybble into H
+0496   02D6 DD 6E 07    	ld l, (ix+7)					; and the low nybble into L
+0497   02D9 CD 12 05    	call ahex_to_byte				; convert it to a byte and leave it in A
+0498   02DC FE 01       	cp 1							; check the type
+0499   02DE CA 37 03    	jp z, ihx_eof					; if type == 1 it's an EOF and we're done
+0500   02E1 D2 2F 03    	jp nc, ihx_bad_record			; if type > 1 it's a record we don't support
+0501   02E4             									; else it's a data record
+0502   02E4 DD 66 00    	ld h, (ix)						; load the high nybble of the length field into H
+0503   02E7 DD 6E 01    	ld l, (ix+1)					; and the low nybble into L
+0504   02EA CD 12 05    	call ahex_to_byte				; convert it to a number
+0505   02ED 4F          	ld c, a							; save length to C
+0506   02EE DD 66 02    	ld h, (ix+2)					; load the high byte of the address field into HL
+0507   02F1 DD 6E 03    	ld l, (ix+3)					; ...
+0508   02F4 CD 12 05    	call ahex_to_byte				; convert it
+0509   02F7 57          	ld d, a							; save it in D
+0510   02F8 DD 66 04    	ld h, (ix+4)					; load the low byte of the address field into HL
+0511   02FB DD 6E 05    	ld l, (ix+5)					; ...
+0512   02FE CD 12 05    	call ahex_to_byte				; convert it
+0513   0301 5F          	ld e, a							; save it in E
+0514   0302             									; length is in C, address is in DE
+0515   0302 DD 21 4A 20 	ld ix, v_rxbuf+9				; load start of data section of record into IX
+0516   0306 06 00       	ld b, 0
+0517   0308             ihx_load_loop:
+0518   0308 DD 66 00    	ld h, (ix)
+0519   030B DD 6E 01    	ld l, (ix+1)
+0520   030E 7C          	ld a, h
+0521   030F FE 00       	cp 0
+0522   0311 28 14       	jr z, ihx_record_short
+0523   0313 CD 12 05    	call ahex_to_byte
+0524   0316 12          	ld (de), a
+0525   0317 80          	add a, b						; add A to B to generate the checksum
+0526   0318 47          	ld b, a							; store it in B
+0527   0319 DD 23       	inc ix
+0528   031B DD 23       	inc ix
+0529   031D 13          	inc de
+0530   031E 0D          	dec c
+0531   031F 79          	ld a, c
+0532   0320 FE 00       	cp 0
+0533   0322 28 1B       	jr z, ihx_ok
+0534   0324 C3 08 03    	jp ihx_load_loop
+0535   0327             
+0536   0327             ihx_record_short:
+0537   0327 21 CA 06    	ld hl, msg_ihx_shortrec
+0538   032A CD 75 05    	call uart_putstr
+0539   032D 18 17       	jr ihx_end
+0540   032F             ihx_bad_record:
+0541   032F 21 A3 06    	ld hl, msg_ihx_badrec
+0542   0332 CD 75 05    	call uart_putstr
+0543   0335 18 0F       	jr ihx_end
+0544   0337             ihx_eof:
+0545   0337 21 F7 06    	ld hl, msg_ihx_eof
+0546   033A CD 75 05    	call uart_putstr
+0547   033D 18 07       	jr ihx_end
+0548   033F             ihx_ok:
+0549   033F 26 4F       	ld h, 'O'
+0550   0341 2E 4B       	ld l, 'K'
+0551   0343 CD 90 05    	call uart_put_hl
+0552   0346             ihx_end:
+0553   0346 C3 DB 01    	jp ml_prompt_restart
+0554   0349             	
+0555   0349             ; -----------------------------------------------------------------------------
+0556   0349             ; Command: f <hexaddr> <hexlen> <hexval>
+0557   0349             ; 	Write <hexval> to memory starting at <hexaddr> for <hexlen> bytes.
+0558   0349             ; -----------------------------------------------------------------------------	
+0559   0349             cmd_fill:
+0560   0349 3E 01       	ld a, IDX_ARG_1					; get start address string pointer
+0561   034B CD E1 04    	call get_substr					; ...
+0562   034E CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0563   0351 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0564   0354 E5          	push hl							; load it into BC via the stack because get_str will smash IX next time we call it
+0565   0355 D1          	pop de							; ...
+0566   0356             	
+0567   0356 3E 02       	ld a, IDX_ARG_2					; get length string pointer
+0568   0358 CD E1 04    	call get_substr					; ...
+0569   035B CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0570   035E CD B8 03    	call check_hexarg				; validate the argument
+0571   0361 E5          	push hl
+0572   0362 C1          	pop bc
+0573   0363             	
+0574   0363 3E 03       	ld a, IDX_ARG_3					; get value argument string pointer
+0575   0365 CD E1 04    	call get_substr					; ...
+0576   0368 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0577   036B CD B8 03    	call check_hexarg				; validate the argument
+0578   036E             	
+0579   036E 7D          	ld a, l
+0580   036F D5          	push de
+0581   0370 E1          	pop hl
+0582   0371 C5          	push bc
+0583   0372 D1          	pop de
+0584   0373 CD 68 04    	call memset
+0585   0376 C3 DB 01    	jp ml_prompt_restart
+0586   0379             	
+0587   0379             ; -----------------------------------------------------------------------------
+0588   0379             ; Command: i <hexport>
+0589   0379             ; 	Read value of port at low byte of <hexport> and print it.
+0590   0379             ; -----------------------------------------------------------------------------
+0591   0379             cmd_input:
+0592   0379 3E 01       	ld a, IDX_ARG_1					; get port argument string pointer
+0593   037B CD E1 04    	call get_substr					; ...
+0594   037E CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0595   0381 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0596   0384 E5          	push hl							; load it into BC via the stack because get_str will smash IX next time we call it
+0597   0385 C1          	pop bc							; ...
+0598   0386 ED 78       	in a, (c)						; read port
+0599   0388 CD 2A 05    	call byte_to_ahex				; convert it to ASCII hex
+0600   038B CD 90 05    	call uart_put_hl				; print it
+0601   038E C3 DB 01    	jp ml_prompt_restart
+0602   0391             
+0603   0391             ; -----------------------------------------------------------------------------
+0604   0391             ; Command: o <hexport> <hexval>
+0605   0391             ; 	Write low byte of <hexval> to port at low byte of <hexport>.
+0606   0391             ; -----------------------------------------------------------------------------
+0607   0391             cmd_output:
+0608   0391 3E 01       	ld a, IDX_ARG_1					; get port argument string pointer
+0609   0393 CD E1 04    	call get_substr					; ...
+0610   0396 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0611   0399 CD B8 03    	call check_hexarg				; validate the argument (exits the command if fail)
+0612   039C E5          	push hl							; load it into BC via the stack because get_str will smash IX next time we call it
+0613   039D C1          	pop bc							; ...
+0614   039E             	
+0615   039E 3E 02       	ld a, IDX_ARG_2					; get value argument string pointer
+0616   03A0 CD E1 04    	call get_substr					; ...
+0617   03A3 CD ED 03    	call get_str_hex_val			; convert string to hex value and leave it in HL
+0618   03A6 CD B8 03    	call check_hexarg				; validate the argument
+0619   03A9 7D          	ld a, l							; load low byte of HL (input value) into A
+0620   03AA ED 79       	out (c), a						; and output it to port at C
+0621   03AC C3 DB 01    	jp ml_prompt_restart
+0622   03AF             	
+0623   03AF             cmd_help:
+0624   03AF 21 1A 07    	ld hl, help
+0625   03B2 CD 75 05    	call uart_putstr
+0626   03B5 C3 DB 01    	jp ml_prompt_restart
+0627   03B8             
+0628   03B8             ; -----------------------------------------------------------------------------
+0629   03B8             ; Handler for get_str_hex_val return codes in command processing
+0630   03B8             ; If no error, returns to procedure it was called from.
+0631   03B8             ; If error, prints an appropriate error message, fixes the stack, 
+0632   03B8             ; and jumps back to the tail of the CLI loop.
+0633   03B8             ; This should only be called from the command handler after get_str_hex_val
+0634   03B8             ; has been called or it will corrupt the call stack.
+0635   03B8             ; -----------------------------------------------------------------------------
+0636   03B8             check_hexarg:
+0637   03B8 FE 01       	cp 1
+0638   03BA 28 05       	jr z, check_err_no_arg
+0639   03BC FE 02       	cp 2
+0640   03BE 30 17       	jr nc, check_err_arg_too_long
+0641   03C0             check_ok:
+0642   03C0 C9          	ret
+0643   03C1             check_err_no_arg:
+0644   03C1 21 C2 05    	ld hl, ansi_fg_red
+0645   03C4 CD 75 05    	call uart_putstr
+0646   03C7 21 71 06    	ld hl, err_hexarg_ne
+0647   03CA CD 75 05    	call uart_putstr
+0648   03CD 21 E6 05    	ld hl, ansi_fg_white
+0649   03D0 CD 75 05    	call uart_putstr
+0650   03D3 E1          	pop hl							; pop the stack so we don't leak the previous call
+0651   03D4 C3 DB 01    	jp ml_prompt_restart			; jump back to the main CLI loop
+0652   03D7             check_err_arg_too_long:
+0653   03D7 21 C2 05    	ld hl, ansi_fg_red
+0654   03DA CD 75 05    	call uart_putstr
+0655   03DD 21 88 06    	ld hl, err_hexarg_range
+0656   03E0 CD 75 05    	call uart_putstr
+0657   03E3 21 E6 05    	ld hl, ansi_fg_white
+0658   03E6 CD 75 05    	call uart_putstr
+0659   03E9 E1          	pop hl							; pop the stack so we don't leak the previous call
+0660   03EA C3 DB 01    	jp ml_prompt_restart			; jump back to the main CLI loop
+0661   03ED             	
+0662   03ED             
+0663   03ED             ; -----------------------------------------------------------------------------
+0664   03ED             ; Get hex argument as 16 bit value
+0665   03ED             ; Inputs:
+0666   03ED             ;	IX: ASCII string pointer
+0667   03ED             ; Outputs:
+0668   03ED             ;	A: 0 if no error, 1 if no argument, 2 if argument too long
+0669   03ED             ;	H: high byte of hex value
+0670   03ED             ;	L: low byte of hex value
+0671   03ED             ; Uses:
+0672   03ED             ;	DE IX
+0673   03ED             ; -----------------------------------------------------------------------------
+0674   03ED             get_str_hex_val:
+0675   03ED C5          	push bc
+0676   03EE D5          	push de
+0677   03EF DD E5       	push ix
+0678   03F1 CD 72 04    	call strlen						; get length of string pointed to by IX
+0679   03F4 FE 00       	cp 0
+0680   03F6 CA 5A 04    	jp z, get_hex_end_err_1
+0681   03F9 FE 05       	cp 5
+0682   03FB D2 5F 04    	jp nc, get_hex_end_err_2
+0683   03FE FE 01       	cp 1							
+0684   0400 28 48       	jr z, get_hex_4_bit				; 4 bit (1 hex char) argument
+0685   0402 FE 02       	cp 2
+0686   0404 28 33       	jr z, get_hex_8_bit				; 8 bit (2 hex char) argument
+0687   0406 FE 03       	cp 3
+0688   0408 28 18       	jr z, get_hex_12_bit			; 12 bit (3 hex char) argument
+0689   040A             
+0690   040A             get_hex_16_bit:
+0691   040A DD 66 00        ld h, (ix)						; get high order nybble of high order byte and stash it in h
+0692   040D DD 6E 01        ld l, (ix+1)					; get low order nybble of high order byte and stash it in l
+0693   0410 CD 12 05    	call ahex_to_byte				; convert ASCII value to a byte
+0694   0413 57          	ld d, a							; save it to d
+0695   0414 DD 66 02    	ld h, (ix+2)					; do the same for the low order byte
+0696   0417 DD 6E 03    	ld l, (ix+3)					; ...
+0697   041A CD 12 05    	call ahex_to_byte				; ...
+0698   041D 5F          	ld e, a							; and save it to e
+0699   041E 3E 00       	ld a, 0
+0700   0420 18 3F       	jr get_hex_end
+0701   0422             get_hex_12_bit:
+0702   0422 26 30           ld h, '0'						; pad high order byte with 0 (ASCII)
+0703   0424 DD 6E 00        ld l, (ix)						; get low order nybble of high order byte and stash it in l
+0704   0427 CD 12 05    	call ahex_to_byte				; convert ASCII value to a byte
+0705   042A 57          	ld d, a							; save it to d
+0706   042B DD 66 01    	ld h, (ix+1)					; do the same for the low order byte
+0707   042E DD 6E 02    	ld l, (ix+2)					; ...
+0708   0431 CD 12 05    	call ahex_to_byte				; ...
+0709   0434 5F          	ld e, a							; and save it to e
+0710   0435 3E 00       	ld a, 0
+0711   0437 18 28       	jr get_hex_end
+0712   0439             get_hex_8_bit:
+0713   0439 3E 00       	ld a, 0
+0714   043B 57          	ld d, a							; load zero into d
+0715   043C DD 66 00    	ld h, (ix)						; load value into low order byte
+0716   043F DD 6E 01    	ld l, (ix+1)					; ...
+0717   0442 CD 12 05    	call ahex_to_byte				; ...
+0718   0445 5F          	ld e, a							; and save it to e
+0719   0446 3E 00       	ld a, 0
+0720   0448 18 17       	jr get_hex_end
+0721   044A             get_hex_4_bit:
+0722   044A 3E 00       	ld a, 0
+0723   044C 57          	ld d, a							; load zero into d
+0724   044D 26 30       	ld h, '0'						; pad high order nybble with zero (ASCII)
+0725   044F DD 6E 00    	ld l, (ix)						; ...
+0726   0452 CD 12 05    	call ahex_to_byte				; ...
+0727   0455 5F          	ld e, a							; and save it to e
+0728   0456 3E 00       	ld a, 0
+0729   0458 18 07       	jr get_hex_end
+0730   045A             get_hex_end_err_1:
+0731   045A 3E 01       	ld a, 1
+0732   045C C3 61 04    	jp get_hex_end
+0733   045F             get_hex_end_err_2:
+0734   045F 3E 02       	ld a, 2
+0735   0461             get_hex_end:
+0736   0461 D5          	push de							; transfer value from de to hl via the stack
+0737   0462 E1          	pop hl							; ...
+0738   0463             	
+0739   0463 DD E1       	pop ix
+0740   0465 D1          	pop de
+0741   0466 C1          	pop bc
+0742   0467 C9          	ret
+0743   0468             	
+0744   0468             ; -----------------------------------------------------------------------------
+0745   0468             ; Fill memory with byte
+0746   0468             ; Inputs:
+0747   0468             ;	A: fill value
+0748   0468             ;	HL: start address
+0749   0468             ;	DE:	number of bytes to fill
+0750   0468             ; -----------------------------------------------------------------------------
+0751   0468             memset:
+0752   0468 4F          	ld c, a					; save a into c
+0753   0469 77          	ld (hl), a				; write value in a into memory pointed to by hl
+0754   046A 23          	inc hl					; move to next position to be filled
+0755   046B 1B          	dec de					; decrement de
+0756   046C 7A          	ld a, d					; check de for zero
+0757   046D B3          	or e					; ...
+0758   046E 79          	ld a, c					; restore fill value to a
+0759   046F 20 F7       	jr nz, memset			; if de != 0 keep looping
+0760   0471 C9          	ret						; else return
+0761   0472             
+0762   0472             ; -----------------------------------------------------------------------------
+0763   0472             ; Get length of zero-terminated string
+0764   0472             ; Inputs:
+0765   0472             ;	IX: string start address
+0766   0472             ; Outputs:
+0767   0472             ;	A: string length
+0768   0472             ; -----------------------------------------------------------------------------
+0769   0472             strlen:
+0770   0472 DD E5       	push ix
+0771   0474 C5          	push bc
+0772   0475 0E 00       	ld c, 0
+0773   0477             strlen_loop:
+0774   0477 DD 7E 00    	ld a, (ix)
+0775   047A FE 00       	cp 0
+0776   047C 28 05       	jr z, strlen_end
+0777   047E DD 23       	inc ix
+0778   0480 0C          	inc c
+0779   0481 18 F4       	jr strlen_loop
+0780   0483             strlen_end:
+0781   0483 79          	ld a, c
+0782   0484 C1          	pop bc
+0783   0485 DD E1       	pop ix
+0784   0487 C9          	ret
+0785   0488             	
+0786   0488             ; -----------------------------------------------------------------------------
+0787   0488             ; Copy string in rxbuf to argbuf, replacing spaces with null terminators,
+0788   0488             ; compressing runs of spaces, and counting instances of the replacements
+0789   0488             ; Inputs: (rxbuf)
+0790   0488             ; Outputs: (argbuf)
+0791   0488             ; Used:
+0792   0488             ;	AF, CD, EF, HL
+0793   0488             ; -----------------------------------------------------------------------------
+0794   0488             split:
+0795   0488 F5          	push af
+0796   0489 C5          	push bc
+0797   048A D5          	push de
+0798   048B E5          	push hl
+0799   048C 3E 00       	ld a, 0			
+0800   048E 21 07 21    	ld hl, v_argbuf
+0801   0491 11 A0 00    	ld de, ARGBUFLEN
+0802   0494 CD 68 04    	call memset					; clear argument buffer
+0803   0497 3E 00       	ld a, 0
+0804   0499 32 06 21    	ld (v_argcount), a    		; initialize v_argcount to 0
+0805   049C 32 05 21    	ld (v_argbufpos), a   		; initialize v_argbufpos to 0
+0806   049F 11 41 20    	ld de, v_rxbuf          	; load input string base address in de
+0807   04A2             split_loop:                 	; main loop
+0808   04A2 1A          	ld a, (de)              	; load character pointed to by de into a
+0809   04A3 47          	ld b, a                 	; copy it to b
+0810   04A4 FE 20       	cp ' '                  	; is it a space
+0811   04A6 28 16       	jr z, split_sep         	; if so jump to seperator handling
+0812   04A8 FE 00       	cp 0                    	; is it a zero terminator
+0813   04AA 28 30       	jr z, split_end         	; if so we're done
+0814   04AC 3A 05 21    	ld a, (v_argbufpos)   		; load ARGBUFPOS value into a
+0815   04AF 21 07 21    	ld hl, v_argbuf       		; load ARGBUFP base address into hl
+0816   04B2 CD 5E 05    	call add_a_hl           	; add a to hl
+0817   04B5 78          	ld a, b                 	; get character from b
+0818   04B6 77          	ld (hl), a              	; save character into ARGBUF location pointed to by hl
+0819   04B7 21 05 21    	ld hl, v_argbufpos			; load ARGBUFPOS pointer
+0820   04BA 34          	inc (hl)               	 	; increment ARGBUFPOSP value
+0821   04BB 13          	inc de                  	; increment de
+0822   04BC 18 E4       	jr split_loop           	; jump back and process the next character
+0823   04BE             split_sep:
+0824   04BE 21 05 21    	ld hl, v_argbufpos			; get ARGBUFPOS pointer
+0825   04C1 34          	inc (hl)                	; increment value pointed to
+0826   04C2 7E          	ld a, (hl)              	; load value into a
+0827   04C3 21 07 21    	ld hl, v_argbuf				; load argbuf base address in hl
+0828   04C6 CD 5E 05    	call add_a_hl           	; add a to hl
+0829   04C9 36 00       	ld (hl), 0              	; store a zero terminator
+0830   04CB 21 06 21    	ld hl, v_argcount
+0831   04CE 34          	inc (hl)
+0832   04CF 13          	inc de                  	; increment de
+0833   04D0             skip_repeated_sep:
+0834   04D0 1A          	ld a, (de)
+0835   04D1 FE 20       	cp ' '
+0836   04D3 20 CD       	jr nz, split_loop
+0837   04D5 FE 00       	cp 0
+0838   04D7 28 03       	jr z, split_end
+0839   04D9 13          	inc de
+0840   04DA 18 F4       	jr skip_repeated_sep
+0841   04DC             split_end:
+0842   04DC E1          	pop hl
+0843   04DD D1          	pop de
+0844   04DE C1          	pop bc
+0845   04DF F1          	pop af
+0846   04E0 C9          	ret
+0847   04E1             
+0848   04E1             ; -----------------------------------------------------------------------------
+0849   04E1             ; Search argbuf for the nth null, then advance one and return the address.
+0850   04E1             ; Inputs:
+0851   04E1             ;	A: argument index to search for
+0852   04E1             ; Outputs:
+0853   04E1             ;	IX: pointer to argument substring
+0854   04E1             ; Uses:
+0855   04E1             ;	BC
+0856   04E1             ; -----------------------------------------------------------------------------
+0857   04E1             get_substr:
+0858   04E1 F5          	push af
+0859   04E2 C5          	push bc
+0860   04E3 FE 00       	cp 0                    ; if index == 0 just return the base argbuf pointer
+0861   04E5 DD 21 07 21 	ld ix, v_argbuf    
+0862   04E9 20 02       	jr nz, get_substr_start
+0863   04EB 18 15       	jr get_substr_end
+0864   04ED             get_substr_start:
+0865   04ED 4F          	ld c, a                 ; save the target index in c
+0866   04EE 06 00       	ld b, 0                 ; initialize b (search counter) to zero
+0867   04F0             get_substr_loop:
+0868   04F0 DD 23       	inc ix
+0869   04F2 DD 7E 00    	ld a, (ix)
+0870   04F5 FE 00       	cp 0
+0871   04F7 28 02       	jr z, get_substr_sep_found
+0872   04F9 18 F5       	jr get_substr_loop
+0873   04FB             get_substr_sep_found:
+0874   04FB 04          	inc b
+0875   04FC 79          	ld a, c
+0876   04FD B8          	cp b
+0877   04FE 20 F0       	jr nz, get_substr_loop
+0878   0500 DD 23       	inc ix
+0879   0502             get_substr_end:
+0880   0502 C1          	pop bc
+0881   0503 F1          	pop af
+0882   0504 C9          	ret
+0883   0505             
+0884   0505             ; -----------------------------------------------------------------------------
+0885   0505             ; Print the command prompt
+0886   0505             ; Inputs: none
+0887   0505             ; Outputs: none
+0888   0505             ; -----------------------------------------------------------------------------
+0889   0505             display_prompt:
+0890   0505 21 1C 06    	ld hl, crlf
+0891   0508 CD 75 05    	call uart_putstr
+0892   050B 21 3B 06    	ld hl, prompt
+0893   050E CD 75 05    	call uart_putstr
+0894   0511 C9          	ret
+0895   0512             
+0896   0512             ; -----------------------------------------------------------------------------
+0897   0512             ; Convert ASCII hex representation into integer byte.
+0898   0512             ; Inputs:
+0899   0512             ;	H: high ASCII nybble
+0900   0512             ; 	L: low ASCII nybble
+0901   0512             ; Outputs:
+0902   0512             ; 	A: integer representation of ASCII byte
+0903   0512             ; Source:
+0904   0512             ;	"Z80 Assembly Language Subroutines", Leventhal and Saville, 1983, p. 175
+0905   0512             ; -----------------------------------------------------------------------------
+0906   0512             ahex_to_byte:
+0907   0512 7D          	ld a, l
+0908   0513 CD 21 05    	call a_to_bin
+0909   0516 47          	ld b, a
+0910   0517 7C          	ld a, h
+0911   0518 CD 21 05    	call a_to_bin
+0912   051B 0F          	rrca
+0913   051C 0F          	rrca
+0914   051D 0F          	rrca
+0915   051E 0F          	rrca
+0916   051F B0          	or b
+0917   0520 C9          	ret
+0918   0521             a_to_bin:
+0919   0521 D6 30       	sub '0'
+0920   0523 FE 0A       	cp 10
+0921   0525 38 02       	jr c, a_to_bin_1
+0922   0527 D6 07       	sub 7
+0923   0529             a_to_bin_1:
+0924   0529 C9          	ret
+0925   052A             
+0926   052A             ; -----------------------------------------------------------------------------
+0927   052A             ; Convert integer byte into ASCII hex representation.
+0928   052A             ; Inputs:
+0929   052A             ;	A: integer byte to convert
+0930   052A             ; Outputs:
+0931   052A             ; 	H: ASCII representation of high nybble
+0932   052A             ;	L: ASCII representation of low nybble
+0933   052A             ; Uses:
+0934   052A             ;	BC, DE
+0935   052A             ; -----------------------------------------------------------------------------
+0936   052A             byte_to_ahex:
+0937   052A C5          	push bc
+0938   052B D5          	push de
+0939   052C 4F          	ld c, a						; load A into C
+0940   052D 16 10       	ld d, 16					; load 16 into D
+0941   052F CD 50 05    	call c_div_d				; divide C by D
+0942   0532 61          	ld h, c						; load the int result (isolated high nybble) into H
+0943   0533 6F          	ld l, a						; load the remainder (isolated low nybble) into L
+0944   0534 7C          	ld a, h						; load the high nybble into A
+0945   0535 CD 41 05    	call nyb_to_hex_asc			; convert it to ASCII
+0946   0538 67          	ld h, a						; load the ASCII value into H
+0947   0539 7D          	ld a, l						; load the low nybble into A
+0948   053A CD 41 05    	call nyb_to_hex_asc			; convert it to ASCII
+0949   053D 6F          	ld l, a						; load the ASCII value into L
+0950   053E D1          	pop de
+0951   053F C1          	pop bc
+0952   0540 C9          	ret
+0953   0541             nyb_to_hex_asc:
+0954   0541 E6 0F       	and 0fh						; mask off high nybble we don't need (or want) it
+0955   0543 FE 0A       	cp 10						; is nybble >= 10?
+0956   0545 D2 4B 05    	jp nc, ntha_ge_ten			; if so jump to the >= 10 part
+0957   0548 C6 30       	add a, 48					; otherwise add 48 to get the ascii representation
+0958   054A C9          	ret
+0959   054B             ntha_ge_ten:
+0960   054B D6 0A       	sub 10						; subtract 10 from the nybble
+0961   054D C6 41       	add a, 65					; add 65 to get the ascii representation
+0962   054F C9          	ret
+0963   0550             	
+0964   0550             ; -----------------------------------------------------------------------------
+0965   0550             ; Divide C by D
+0966   0550             ; Input:
+0967   0550             ;	C: numerator
+0968   0550             ;	D: denominator
+0969   0550             ; Output:
+0970   0550             ;	A: remainder
+0971   0550             ;	B: 0
+0972   0550             ;	C: integer result of C/D
+0973   0550             ; Source:
+0974   0550             ;	http://z80-heaven.wikidot.com/math#toc13
+0975   0550             ; -----------------------------------------------------------------------------
+0976   0550             c_div_d:
+0977   0550 06 08       	ld b, 8
+0978   0552 AF          	xor a
+0979   0553 CB 21       	sla c
+0980   0555 17          	rla
+0981   0556 BA          	cp d
+0982   0557 38 02       	jr c, $+4
+0983   0559 0C          	inc c
+0984   055A 92          	sub d
+0985   055B 10 F6       	djnz $-8
+0986   055D C9          	ret
+0987   055E             
+0988   055E             ; -----------------------------------------------------------------------------
+0989   055E             ; Add A to HL
+0990   055E             ; -----------------------------------------------------------------------------
+0991   055E             add_a_hl:
+0992   055E 85              add a, l
+0993   055F 6F              ld l, a
+0994   0560 8C              adc a, h
+0995   0561 95              sub l
+0996   0562 67              ld h, a
+0997   0563 C9              ret
+0998   0564             
+0999   0564             ; -----------------------------------------------------------------------------
+1000   0564             ; UART init routine
+1001   0564             ; -----------------------------------------------------------------------------
+1002   0564             uart_init:
+1003   0564 3E 80       	ld a, UART_LCR_bit_dle			; set divisor latch enable
+1004   0566 D3 0B       	out (UART_LCR), a				; send it
+1005   0568 3E 1A       	ld a, uart_con_baudl			; set divisor low byte
+1006   056A D3 08       	out (UART_BDL), a				; send it
+1007   056C 3E 00       	ld a, uart_con_baudh			; set divisor high byte
+1008   056E D3 09       	out (UART_BDH), a				; send it
+1009   0570             	;ld a, 1h						; set FCR bit 0 (enable 16550 FIFOs)
+1010   0570             	;out (UART_FCR), a				; send it
+1011   0570 3E 03       	ld a, uart_con_lcr				; clear dle, set format
+1012   0572 D3 0B       	out (UART_LCR), a				; send it
+1013   0574 C9          	ret
+1014   0575             
+1015   0575             ; -----------------------------------------------------------------------------
+1016   0575             ; UART transmit string routine
+1017   0575             ; Transmits a zero-terminated string pointed to by HL
+1018   0575             ; -----------------------------------------------------------------------------
+1019   0575             uart_putstr:
+1020   0575 7E          	ld a, (hl)						; load char pointed to by hl into a
+1021   0576 23          	inc hl							; increment hl
+1022   0577 A7          	and a							; A & A to set zero flag if A = 0
+1023   0578 28 0C       	jr z, uart_tx_end				; jump to end if zero
+1024   057A F5          	push af							; save flags while we poll
+1025   057B D3 08       	out (UART_THR), a				; send it
+1026   057D             uart_tx_poll:						; poll uart tx status
+1027   057D DB 0D       	in a, (UART_LSR)				; read the uart line status register
+1028   057F CB 6F       	bit UART_LSR_bit_thre, a		; check if bit 5 is zero (tx holding register full)
+1029   0581 28 FA       	jr z, uart_tx_poll				; poll until uart finishes transmitting (bit 5 set)
+1030   0583 F1          	pop af							; restore flags
+1031   0584 20 EF       	jr nz, uart_putstr				; if not zero loop back and get the next char
+1032   0586             uart_tx_end:
+1033   0586 C9          	ret								; return
+1034   0587             
+1035   0587             ; -----------------------------------------------------------------------------
+1036   0587             ; UART transmit char routine
+1037   0587             ; Inputs:
+1038   0587             ;	A: character to transmit
+1039   0587             ; -----------------------------------------------------------------------------
+1040   0587             uart_putch:
+1041   0587 D3 08       	out (UART_THR), a
+1042   0589             putch_tx_poll:						; poll uart tx status
+1043   0589 DB 0D       	in a, (UART_LSR)				; read the uart line status register
+1044   058B CB 6F       	bit UART_LSR_bit_thre, a		; check if bit 5 is zero (tx holding register full)
+1045   058D 28 FA       	jr z, putch_tx_poll				; poll until uart finishes transmitting (bit 5 set)	
+1046   058F C9          	ret
+1047   0590             
+1048   0590             ; -----------------------------------------------------------------------------
+1049   0590             ; Transmit characters in HL
+1050   0590             ; Inputs:
+1051   0590             ;	H:	first character to transmit
+1052   0590             ;	L:	second character to transmit
+1053   0590             ; -----------------------------------------------------------------------------
+1054   0590             uart_put_hl:
+1055   0590 7C          	ld a, h							; load h into a
+1056   0591 CD 87 05    	call uart_putch					; send it
+1057   0594 7D          	ld a, l							; load l into a
+1058   0595 CD 87 05    	call uart_putch					; send it
+1059   0598 C9          	ret
+1060   0599             
+1061   0599             ; -----------------------------------------------------------------------------
+1062   0599             ; UART recieve character routine
+1063   0599             ; Blocks until a character is received, places received char in A
+1064   0599             ; -----------------------------------------------------------------------------
+1065   0599             uart_getch:
+1066   0599 3E 02       	ld a, 02h
+1067   059B D3 0C       	out (UART_MCR), a				; set the RTS enable bit
+1068   059D             uart_getch_loop:
+1069   059D DB 0D       	in a, (UART_LSR)				; poll for a byte recieved
+1070   059F CB 47       	bit UART_LSR_bit_rxr, a
+1071   05A1 28 FA       	jr z, uart_getch_loop
+1072   05A3 3E 00       	ld a, 00h
+1073   05A5 D3 0C       	out (UART_MCR), a				; clear the RTS enable bit		
+1074   05A7 DB 08       	in a, (UART_RHR)
+1075   05A9 C9          	ret
+1076   05AA             
+1077   05AA             ; -----------------------------------------------------------------------------
+1078   05AA             ; Delay Subroutine
+1079   05AA             ; Load number of loops (16 bit, up to 65,535) to delay into BC and call this.
+1080   05AA             ; -----------------------------------------------------------------------------
+1081   05AA             delay:
+1082   05AA 78          	ld a, b						; Load B into A
+1083   05AB B1          	or c						; OR it with C, if the result is zero the 'or' instruction sets the Z flag
+1084   05AC 0B          	dec bc						; Decrement BC		
+1085   05AD 20 FB       	jr nz, delay				; If it's not zero loop back to the start of the subroutine
+1086   05AF C9          	ret							; If so, we're done delaying
+1087   05B0             
+1088   05B0             ; Some ANSI terminal control codes
+1089   05B0 1B 5B 32 4A ansi_csi_clear		.db 1Bh,"[2J",0
+1089   05B4 00 
+1090   05B5 1B 5B 31 3B ansi_csi_home		.db 1Bh,"[1;1H",0
+1090   05B9 31 48 00 
+1091   05BC 1B 5B 33 30 ansi_fg_black		.db 1Bh,"[30m",0
+1091   05C0 6D 00 
+1092   05C2 1B 5B 33 31 ansi_fg_red			.db 1Bh,"[31m",0
+1092   05C6 6D 00 
+1093   05C8 1B 5B 33 32 ansi_fg_green		.db 1Bh,"[32m",0
+1093   05CC 6D 00 
+1094   05CE 1B 5B 33 33 ansi_fg_yellow		.db 1Bh,"[33m",0
+1094   05D2 6D 00 
+1095   05D4 1B 5B 33 34 ansi_fg_blue		.db 1Bh,"[34m",0
+1095   05D8 6D 00 
+1096   05DA 1B 5B 33 35 ansi_fg_magenta		.db 1Bh,"[35m",0
+1096   05DE 6D 00 
+1097   05E0 1B 5B 33 36 ansi_fg_cyan		.db 1Bh,"[36m",0
+1097   05E4 6D 00 
+1098   05E6 1B 5B 33 37 ansi_fg_white		.db 1Bh,"[37m",0
+1098   05EA 6D 00 
+1099   05EC 1B 5B 34 30 ansi_bg_black		.db 1Bh,"[40m",0
+1099   05F0 6D 00 
+1100   05F2 1B 5B 34 31 ansi_bg_red			.db 1Bh,"[41m",0
+1100   05F6 6D 00 
+1101   05F8 1B 5B 34 32 ansi_bg_green		.db 1Bh,"[42m",0
+1101   05FC 6D 00 
+1102   05FE 1B 5B 34 33 ansi_bg_yellow		.db 1Bh,"[43m",0
+1102   0602 6D 00 
+1103   0604 1B 5B 34 34 ansi_bg_blue		.db 1Bh,"[44m",0
+1103   0608 6D 00 
+1104   060A 1B 5B 34 35 ansi_bg_magenta 	.db 1Bh,"[45m",0
+1104   060E 6D 00 
+1105   0610 1B 5B 34 36 ansi_bg_cyan		.db 1Bh,"[46m",0
+1105   0614 6D 00 
+1106   0616 1B 5B 34 37 ansi_bg_white		.db 1Bh,"[47m",0	
+1106   061A 6D 00 
+1107   061C             ; String table
+1108   061C 0D 0A 00    crlf				.db "\r\n",0
+1109   061F 08 20 08 00 termbs				.db 08h,' ',08h,0
+1110   0623 43 4F 4F 46 hello				.db "COOFMON-Z80 ROM Monitor",0
+1110   0627 4D 4F 4E 2D 
+1110   062B 5A 38 30 20 
+1110   062F 52 4F 4D 20 
+1110   0633 4D 6F 6E 69 
+1110   0637 74 6F 72 00 
+1111   063B 63 6F 6F 66 prompt				.db "coofmon> ",0
+1111   063F 6D 6F 6E 3E 
+1111   0643 20 00 
+1112   0645 49 6E 70 75 toolong				.db "Input buffer overflow.",0
+1112   0649 74 20 62 75 
+1112   064D 66 66 65 72 
+1112   0651 20 6F 76 65 
+1112   0655 72 66 6C 6F 
+1112   0659 77 2E 00 
+1113   065C 45 52 52 3A err_bad_command		.db "ERR: Unknown command",0
+1113   0660 20 55 6E 6B 
+1113   0664 6E 6F 77 6E 
+1113   0668 20 63 6F 6D 
+1113   066C 6D 61 6E 64 
+1113   0670 00 
+1114   0671 45 52 52 3A err_hexarg_ne		.db "ERR: Argument required",0
+1114   0675 20 41 72 67 
+1114   0679 75 6D 65 6E 
+1114   067D 74 20 72 65 
+1114   0681 71 75 69 72 
+1114   0685 65 64 00 
+1115   0688 45 52 52 3A err_hexarg_range	.db "ERR: Argument out of range",0
+1115   068C 20 41 72 67 
+1115   0690 75 6D 65 6E 
+1115   0694 74 20 6F 75 
+1115   0698 74 20 6F 66 
+1115   069C 20 72 61 6E 
+1115   06A0 67 65 00 
+1116   06A3 45 52 52 3A msg_ihx_badrec		.db "ERR: Unsupported Intel Hex record type",0
+1116   06A7 20 55 6E 73 
+1116   06AB 75 70 70 6F 
+1116   06AF 72 74 65 64 
+1116   06B3 20 49 6E 74 
+1116   06B7 65 6C 20 48 
+1116   06BB 65 78 20 72 
+1116   06BF 65 63 6F 72 
+1116   06C3 64 20 74 79 
+1116   06C7 70 65 00 
+1117   06CA 45 52 52 3A msg_ihx_shortrec	.db "ERR: Intel Hex record seems to be incomplete",0
+1117   06CE 20 49 6E 74 
+1117   06D2 65 6C 20 48 
+1117   06D6 65 78 20 72 
+1117   06DA 65 63 6F 72 
+1117   06DE 64 20 73 65 
+1117   06E2 65 6D 73 20 
+1117   06E6 74 6F 20 62 
+1117   06EA 65 20 69 6E 
+1117   06EE 63 6F 6D 70 
+1117   06F2 6C 65 74 65 
+1117   06F6 00 
+1118   06F7 49 4E 46 4F msg_ihx_eof			.db "INFO: Intel Hex EOF record reached",0
+1118   06FB 3A 20 49 6E 
+1118   06FF 74 65 6C 20 
+1118   0703 48 65 78 20 
+1118   0707 45 4F 46 20 
+1118   070B 72 65 63 6F 
+1118   070F 72 64 20 72 
+1118   0713 65 61 63 68 
+1118   0717 65 64 00 
+1119   071A 43 4F 4F 46 help				.db "COOFMON-Z80 Commands\r\n"
+1119   071E 4D 4F 4E 2D 
+1119   0722 5A 38 30 20 
+1119   0726 43 6F 6D 6D 
+1119   072A 61 6E 64 73 
+1119   072E 0D 0A 
+1120   0730 64 5B 75 6D 					.db "d[ump] <hexaddr> <hexlen>\r\n"
+1120   0734 70 5D 20 3C 
+1120   0738 68 65 78 61 
+1120   073C 64 64 72 3E 
+1120   0740 20 3C 68 65 
+1120   0744 78 6C 65 6E 
+1120   0748 3E 0D 0A 
+1121   074B 09 44 75 6D 					.db "	Dump <hexlen> bytes memory starting at <hexaddr>\r\n\r\n"
+1121   074F 70 20 3C 68 
+1121   0753 65 78 6C 65 
+1121   0757 6E 3E 20 62 
+1121   075B 79 74 65 73 
+1121   075F 20 6D 65 6D 
+1121   0763 6F 72 79 20 
+1121   0767 73 74 61 72 
+1121   076B 74 69 6E 67 
+1121   076F 20 61 74 20 
+1121   0773 3C 68 65 78 
+1121   0777 61 64 64 72 
+1121   077B 3E 0D 0A 0D 
+1121   077F 0A 
+1122   0780 78 5B 65 63 					.db "x[ecute] <hexaddr>\r\n"
+1122   0784 75 74 65 5D 
+1122   0788 20 3C 68 65 
+1122   078C 78 61 64 64 
+1122   0790 72 3E 0D 0A 
+1123   0794 09 4A 75 6D 					.db "	Jump to <hexaddr> and execute\r\n\r\n"
+1123   0798 70 20 74 6F 
+1123   079C 20 3C 68 65 
+1123   07A0 78 61 64 64 
+1123   07A4 72 3E 20 61 
+1123   07A8 6E 64 20 65 
+1123   07AC 78 65 63 75 
+1123   07B0 74 65 0D 0A 
+1123   07B4 0D 0A 
+1124   07B6 63 5B 61 6C 					.db "c[all] <hexaddr>\r\n"
+1124   07BA 6C 5D 20 3C 
+1124   07BE 68 65 78 61 
+1124   07C2 64 64 72 3E 
+1124   07C6 0D 0A 
+1125   07C8 09 43 61 6C 					.db "	Call <hexaddr>\r\n\r\n"
+1125   07CC 6C 20 3C 68 
+1125   07D0 65 78 61 64 
+1125   07D4 64 72 3E 0D 
+1125   07D8 0A 0D 0A 
+1126   07DB 66 5B 69 6C 					.db "f[ill] <hexaddr> <hexlen> <hexval>\r\n"
+1126   07DF 6C 5D 20 3C 
+1126   07E3 68 65 78 61 
+1126   07E7 64 64 72 3E 
+1126   07EB 20 3C 68 65 
+1126   07EF 78 6C 65 6E 
+1126   07F3 3E 20 3C 68 
+1126   07F7 65 78 76 61 
+1126   07FB 6C 3E 0D 0A 
+1127   07FF 09 46 69 6C 					.db "	Fill <hexlen> bytes starting at <hexaddr> with <hexval>\r\n\r\n"
+1127   0803 6C 20 3C 68 
+1127   0807 65 78 6C 65 
+1127   080B 6E 3E 20 62 
+1127   080F 79 74 65 73 
+1127   0813 20 73 74 61 
+1127   0817 72 74 69 6E 
+1127   081B 67 20 61 74 
+1127   081F 20 3C 68 65 
+1127   0823 78 61 64 64 
+1127   0827 72 3E 20 77 
+1127   082B 69 74 68 20 
+1127   082F 3C 68 65 78 
+1127   0833 76 61 6C 3E 
+1127   0837 0D 0A 0D 0A 
+1128   083B 3A 69 68 78 					.db ":ihxstring\r\n"
+1128   083F 73 74 72 69 
+1128   0843 6E 67 0D 0A 
+1129   0847 09 4C 6F 61 					.db "	Load Intel hex string into memory\r\n\r\n"
+1129   084B 64 20 49 6E 
+1129   084F 74 65 6C 20 
+1129   0853 68 65 78 20 
+1129   0857 73 74 72 69 
+1129   085B 6E 67 20 69 
+1129   085F 6E 74 6F 20 
+1129   0863 6D 65 6D 6F 
+1129   0867 72 79 0D 0A 
+1129   086B 0D 0A 
+1130   086D 77 5B 72 69 					.db "w[rite] <hexval> <hexaddr>\r\n"
+1130   0871 74 65 5D 20 
+1130   0875 3C 68 65 78 
+1130   0879 76 61 6C 3E 
+1130   087D 20 3C 68 65 
+1130   0881 78 61 64 64 
+1130   0885 72 3E 0D 0A 
+1131   0889 09 57 72 69 					.db "	Write <hexval> to memory location <hexaddr>\r\n\r\n"
+1131   088D 74 65 20 3C 
+1131   0891 68 65 78 76 
+1131   0895 61 6C 3E 20 
+1131   0899 74 6F 20 6D 
+1131   089D 65 6D 6F 72 
+1131   08A1 79 20 6C 6F 
+1131   08A5 63 61 74 69 
+1131   08A9 6F 6E 20 3C 
+1131   08AD 68 65 78 61 
+1131   08B1 64 64 72 3E 
+1131   08B5 0D 0A 0D 0A 
+1132   08B9 69 5B 6E 70 					.db "i[nput] <hexport>\r\n"
+1132   08BD 75 74 5D 20 
+1132   08C1 3C 68 65 78 
+1132   08C5 70 6F 72 74 
+1132   08C9 3E 0D 0A 
+1133   08CC 09 52 65 61 					.db "	Read <hexport> and print the value (high order byte ignored)\r\n\r\n"
+1133   08D0 64 20 3C 68 
+1133   08D4 65 78 70 6F 
+1133   08D8 72 74 3E 20 
+1133   08DC 61 6E 64 20 
+1133   08E0 70 72 69 6E 
+1133   08E4 74 20 74 68 
+1133   08E8 65 20 76 61 
+1133   08EC 6C 75 65 20 
+1133   08F0 28 68 69 67 
+1133   08F4 68 20 6F 72 
+1133   08F8 64 65 72 20 
+1133   08FC 62 79 74 65 
+1133   0900 20 69 67 6E 
+1133   0904 6F 72 65 64 
+1133   0908 29 0D 0A 0D 
+1133   090C 0A 
+1134   090D 6F 5B 75 74 					.db "o[utput] <hexport> <hexval>\r\n"
+1134   0911 70 75 74 5D 
+1134   0915 20 3C 68 65 
+1134   0919 78 70 6F 72 
+1134   091D 74 3E 20 3C 
+1134   0921 68 65 78 76 
+1134   0925 61 6C 3E 0D 
+1134   0929 0A 
+1135   092A 09 57 72 69 					.db "	Write <hexval> to <hexport> (high order byte ignored)\r\n",0
+1135   092E 74 65 20 3C 
+1135   0932 68 65 78 76 
+1135   0936 61 6C 3E 20 
+1135   093A 74 6F 20 3C 
+1135   093E 68 65 78 70 
+1135   0942 6F 72 74 3E 
+1135   0946 20 28 68 69 
+1135   094A 67 68 20 6F 
+1135   094E 72 64 65 72 
+1135   0952 20 62 79 74 
+1135   0956 65 20 69 67 
+1135   095A 6E 6F 72 65 
+1135   095E 64 29 0D 0A 
+1135   0962 00 
+1136   0963             ; Character pattern table for use with an LCD or similar.
+1137   1000             CHARTABLE:		.org $1000
+1138   1000 00 00 00 00 Char_000		.db	$00, $00, $00, $00, $00, $00, $00, $00	; (.)
+1138   1004 00 00 00 00 
+1139   1008 7E 81 A5 81 Char_001		.db	$7E, $81, $A5, $81, $BD, $99, $81, $7E	; (.)
+1139   100C BD 99 81 7E 
+1140   1010 3C 7E DB FF Char_002		.db	$3C, $7E, $DB, $FF, $C3, $7E, $3C, $00	; (.)
+1140   1014 C3 7E 3C 00 
+1141   1018 00 EE FE FE Char_003		.db	$00, $EE, $FE, $FE, $7C, $38, $10, $00	; (.)
+1141   101C 7C 38 10 00 
+1142   1020 10 38 7C FE Char_004		.db	$10, $38, $7C, $FE, $7C, $38, $10, $00	; (.)
+1142   1024 7C 38 10 00 
+1143   1028 00 3C 18 FF Char_005		.db	$00, $3C, $18, $FF, $FF, $08, $18, $00	; (.)
+1143   102C FF 08 18 00 
+1144   1030 10 38 7C FE Char_006		.db	$10, $38, $7C, $FE, $FE, $10, $38, $00	; (.)
+1144   1034 FE 10 38 00 
+1145   1038 00 00 18 3C Char_007		.db	$00, $00, $18, $3C, $18, $00, $00, $00	; (.)
+1145   103C 18 00 00 00 
+1146   1040 FF FF E7 C3 Char_008		.db	$FF, $FF, $E7, $C3, $E7, $FF, $FF, $FF	; (.)
+1146   1044 E7 FF FF FF 
+1147   1048 00 3C 42 81 Char_009		.db	$00, $3C, $42, $81, $81, $42, $3C, $00	; (.)
+1147   104C 81 42 3C 00 
+1148   1050 FF C3 BD 7E Char_010		.db	$FF, $C3, $BD, $7E, $7E, $BD, $C3, $FF	; (.)
+1148   1054 7E BD C3 FF 
+1149   1058 1F 07 0D 7C Char_011		.db	$1F, $07, $0D, $7C, $C6, $C6, $7C, $00	; (.)
+1149   105C C6 C6 7C 00 
+1150   1060 00 7E C3 C3 Char_012		.db	$00, $7E, $C3, $C3, $7E, $18, $7E, $18	; (.)
+1150   1064 7E 18 7E 18 
+1151   1068 04 06 07 04 Char_013		.db	$04, $06, $07, $04, $04, $FC, $F8, $00	; (.)
+1151   106C 04 FC F8 00 
+1152   1070 0C 0A 0D 0B Char_014		.db	$0C, $0A, $0D, $0B, $F9, $F9, $1F, $1F	; (.)
+1152   1074 F9 F9 1F 1F 
+1153   1078 00 92 7C 44 Char_015		.db	$00, $92, $7C, $44, $C6, $7C, $92, $00	; (.)
+1153   107C C6 7C 92 00 
+1154   1080 00 00 60 78 Char_016		.db	$00, $00, $60, $78, $7E, $78, $60, $00	; (.)
+1154   1084 7E 78 60 00 
+1155   1088 00 00 06 1E Char_017		.db	$00, $00, $06, $1E, $7E, $1E, $06, $00	; (.)
+1155   108C 7E 1E 06 00 
+1156   1090 18 7E 18 18 Char_018		.db	$18, $7E, $18, $18, $18, $18, $7E, $18	; (.)
+1156   1094 18 18 7E 18 
+1157   1098 66 66 66 66 Char_019		.db	$66, $66, $66, $66, $66, $00, $66, $00	; (.)
+1157   109C 66 00 66 00 
+1158   10A0 FF B6 76 36 Char_020		.db	$FF, $B6, $76, $36, $36, $36, $36, $00	; (.)
+1158   10A4 36 36 36 00 
+1159   10A8 7E C1 DC 22 Char_021		.db	$7E, $C1, $DC, $22, $22, $1F, $83, $7E	; (.)
+1159   10AC 22 1F 83 7E 
+1160   10B0 00 00 00 7E Char_022		.db	$00, $00, $00, $7E, $7E, $00, $00, $00	; (.)
+1160   10B4 7E 00 00 00 
+1161   10B8 18 7E 18 18 Char_023		.db	$18, $7E, $18, $18, $7E, $18, $00, $FF	; (.)
+1161   10BC 7E 18 00 FF 
+1162   10C0 18 7E 18 18 Char_024		.db	$18, $7E, $18, $18, $18, $18, $18, $00	; (.)
+1162   10C4 18 18 18 00 
+1163   10C8 18 18 18 18 Char_025		.db	$18, $18, $18, $18, $18, $7E, $18, $00	; (.)
+1163   10CC 18 7E 18 00 
+1164   10D0 00 04 06 FF Char_026		.db	$00, $04, $06, $FF, $06, $04, $00, $00	; (.)
+1164   10D4 06 04 00 00 
+1165   10D8 00 20 60 FF Char_027		.db	$00, $20, $60, $FF, $60, $20, $00, $00	; (.)
+1165   10DC 60 20 00 00 
+1166   10E0 00 00 00 C0 Char_028		.db	$00, $00, $00, $C0, $C0, $C0, $FF, $00	; (.)
+1166   10E4 C0 C0 FF 00 
+1167   10E8 00 24 66 FF Char_029		.db	$00, $24, $66, $FF, $66, $24, $00, $00	; (.)
+1167   10EC 66 24 00 00 
+1168   10F0 00 00 10 38 Char_030		.db	$00, $00, $10, $38, $7C, $FE, $00, $00	; (.)
+1168   10F4 7C FE 00 00 
+1169   10F8 00 00 00 FE Char_031		.db	$00, $00, $00, $FE, $7C, $38, $10, $00	; (.)
+1169   10FC 7C 38 10 00 
+1170   1100 00 00 00 00 Char_032		.db	$00, $00, $00, $00, $00, $00, $00, $00	; ( )
+1170   1104 00 00 00 00 
+1171   1108 30 30 30 30 Char_033		.db	$30, $30, $30, $30, $30, $00, $30, $00	; (!)
+1171   110C 30 00 30 00 
+1172   1110 66 66 00 00 Char_034		.db	$66, $66, $00, $00, $00, $00, $00, $00	; (")
+1172   1114 00 00 00 00 
+1173   1118 6C 6C FE 6C Char_035		.db	$6C, $6C, $FE, $6C, $FE, $6C, $6C, $00	; (#)
+1173   111C FE 6C 6C 00 
+1174   1120 10 7C D2 7C Char_036		.db	$10, $7C, $D2, $7C, $86, $7C, $10, $00	; ($)
+1174   1124 86 7C 10 00 
+1175   1128 F0 96 FC 18 Char_037		.db	$F0, $96, $FC, $18, $3E, $72, $DE, $00	; (%)
+1175   112C 3E 72 DE 00 
+1176   1130 30 48 30 78 Char_038		.db	$30, $48, $30, $78, $CE, $CC, $78, $00	; (&)
+1176   1134 CE CC 78 00 
+1177   1138 0C 0C 18 00 Char_039		.db	$0C, $0C, $18, $00, $00, $00, $00, $00	; (')
+1177   113C 00 00 00 00 
+1178   1140 10 60 C0 C0 Char_040		.db	$10, $60, $C0, $C0, $C0, $60, $10, $00	; (()
+1178   1144 C0 60 10 00 
+1179   1148 10 0C 06 06 Char_041		.db	$10, $0C, $06, $06, $06, $0C, $10, $00	; ())
+1179   114C 06 0C 10 00 
+1180   1150 00 54 38 FE Char_042		.db	$00, $54, $38, $FE, $38, $54, $00, $00	; (*)
+1180   1154 38 54 00 00 
+1181   1158 00 18 18 7E Char_043		.db	$00, $18, $18, $7E, $18, $18, $00, $00	; (+)
+1181   115C 18 18 00 00 
+1182   1160 00 00 00 00 Char_044		.db	$00, $00, $00, $00, $00, $00, $18, $70	; (,)
+1182   1164 00 00 18 70 
+1183   1168 00 00 00 7E Char_045		.db	$00, $00, $00, $7E, $00, $00, $00, $00	; (-)
+1183   116C 00 00 00 00 
+1184   1170 00 00 00 00 Char_046		.db	$00, $00, $00, $00, $00, $00, $18, $00	; (.)
+1184   1174 00 00 18 00 
+1185   1178 02 06 0C 18 Char_047		.db	$02, $06, $0C, $18, $30, $60, $C0, $00	; (/)
+1185   117C 30 60 C0 00 
+1186   1180 7C CE DE F6 Char_048		.db	$7C, $CE, $DE, $F6, $E6, $E6, $7C, $00	; (0)
+1186   1184 E6 E6 7C 00 
+1187   1188 18 38 78 18 Char_049		.db	$18, $38, $78, $18, $18, $18, $3C, $00	; (1)
+1187   118C 18 18 3C 00 
+1188   1190 7C C6 06 0C Char_050		.db	$7C, $C6, $06, $0C, $30, $60, $FE, $00	; (2)
+1188   1194 30 60 FE 00 
+1189   1198 7C C6 06 3C Char_051		.db	$7C, $C6, $06, $3C, $06, $C6, $7C, $00	; (3)
+1189   119C 06 C6 7C 00 
+1190   11A0 0E 1E 36 66 Char_052		.db	$0E, $1E, $36, $66, $FE, $06, $06, $00	; (4)
+1190   11A4 FE 06 06 00 
+1191   11A8 FE C0 C0 FC Char_053		.db	$FE, $C0, $C0, $FC, $06, $06, $FC, $00	; (5)
+1191   11AC 06 06 FC 00 
+1192   11B0 7C C6 C0 FC Char_054		.db	$7C, $C6, $C0, $FC, $C6, $C6, $7C, $00	; (6)
+1192   11B4 C6 C6 7C 00 
+1193   11B8 FE 06 0C 18 Char_055		.db	$FE, $06, $0C, $18, $30, $60, $60, $00	; (7)
+1193   11BC 30 60 60 00 
+1194   11C0 7C C6 C6 7C Char_056		.db	$7C, $C6, $C6, $7C, $C6, $C6, $7C, $00	; (8)
+1194   11C4 C6 C6 7C 00 
+1195   11C8 7C C6 C6 7E Char_057		.db	$7C, $C6, $C6, $7E, $06, $C6, $7C, $00	; (9)
+1195   11CC 06 C6 7C 00 
+1196   11D0 00 30 00 00 Char_058		.db	$00, $30, $00, $00, $00, $30, $00, $00	; (:)
+1196   11D4 00 30 00 00 
+1197   11D8 00 30 00 00 Char_059		.db	$00, $30, $00, $00, $00, $30, $20, $00	; (;)
+1197   11DC 00 30 20 00 
+1198   11E0 00 1C 30 60 Char_060		.db	$00, $1C, $30, $60, $30, $1C, $00, $00	; (<)
+1198   11E4 30 1C 00 00 
+1199   11E8 00 00 7E 00 Char_061		.db	$00, $00, $7E, $00, $7E, $00, $00, $00	; (=)
+1199   11EC 7E 00 00 00 
+1200   11F0 00 70 18 0C Char_062		.db	$00, $70, $18, $0C, $18, $70, $00, $00	; (>)
+1200   11F4 18 70 00 00 
+1201   11F8 7C C6 0C 18 Char_063		.db	$7C, $C6, $0C, $18, $30, $00, $30, $00	; (?)
+1201   11FC 30 00 30 00 
+1202   1200 7C 82 9A AA Char_064		.db	$7C, $82, $9A, $AA, $AA, $9E, $7C, $00	; (@)
+1202   1204 AA 9E 7C 00 
+1203   1208 7C C6 C6 FE Char_065		.db	$7C, $C6, $C6, $FE, $C6, $C6, $C6, $00	; (A)
+1203   120C C6 C6 C6 00 
+1204   1210 FC 66 66 7C Char_066		.db	$FC, $66, $66, $7C, $66, $66, $FC, $00	; (B)
+1204   1214 66 66 FC 00 
+1205   1218 7C C6 C0 C0 Char_067		.db	$7C, $C6, $C0, $C0, $C0, $C6, $7C, $00	; (C)
+1205   121C C0 C6 7C 00 
+1206   1220 FC 66 66 66 Char_068		.db	$FC, $66, $66, $66, $66, $66, $FC, $00	; (D)
+1206   1224 66 66 FC 00 
+1207   1228 FE 62 68 78 Char_069		.db	$FE, $62, $68, $78, $68, $62, $FE, $00	; (E)
+1207   122C 68 62 FE 00 
+1208   1230 FE 62 68 78 Char_070		.db	$FE, $62, $68, $78, $68, $60, $F0, $00	; (F)
+1208   1234 68 60 F0 00 
+1209   1238 7C C6 C6 C0 Char_071		.db	$7C, $C6, $C6, $C0, $DE, $C6, $7C, $00	; (G)
+1209   123C DE C6 7C 00 
+1210   1240 C6 C6 C6 FE Char_072		.db	$C6, $C6, $C6, $FE, $C6, $C6, $C6, $00	; (H)
+1210   1244 C6 C6 C6 00 
+1211   1248 3C 18 18 18 Char_073		.db	$3C, $18, $18, $18, $18, $18, $3C, $00	; (I)
+1211   124C 18 18 3C 00 
+1212   1250 1E 0C 0C 0C Char_074		.db	$1E, $0C, $0C, $0C, $0C, $CC, $78, $00	; (J)
+1212   1254 0C CC 78 00 
+1213   1258 C6 CC D8 F0 Char_075		.db	$C6, $CC, $D8, $F0, $D8, $CC, $C6, $00	; (K)
+1213   125C D8 CC C6 00 
+1214   1260 F0 60 60 60 Char_076		.db	$F0, $60, $60, $60, $60, $62, $FE, $00	; (L)
+1214   1264 60 62 FE 00 
+1215   1268 C6 EE FE D6 Char_077		.db	$C6, $EE, $FE, $D6, $C6, $C6, $C6, $00	; (M)
+1215   126C C6 C6 C6 00 
+1216   1270 C6 E6 F6 DE Char_078		.db	$C6, $E6, $F6, $DE, $CE, $C6, $C6, $00	; (N)
+1216   1274 CE C6 C6 00 
+1217   1278 7C C6 C6 C6 Char_079		.db	$7C, $C6, $C6, $C6, $C6, $C6, $7C, $00	; (O)
+1217   127C C6 C6 7C 00 
+1218   1280 FC 66 66 7C Char_080		.db	$FC, $66, $66, $7C, $60, $60, $F0, $00	; (P)
+1218   1284 60 60 F0 00 
+1219   1288 7C C6 C6 C6 Char_081		.db	$7C, $C6, $C6, $C6, $C6, $C6, $7C, $0C	; (Q)
+1219   128C C6 C6 7C 0C 
+1220   1290 FC 66 66 7C Char_082		.db	$FC, $66, $66, $7C, $66, $66, $E6, $00	; (R)
+1220   1294 66 66 E6 00 
+1221   1298 7C C6 C0 7C Char_083		.db	$7C, $C6, $C0, $7C, $06, $C6, $7C, $00	; (S)
+1221   129C 06 C6 7C 00 
+1222   12A0 7E 5A 18 18 Char_084		.db	$7E, $5A, $18, $18, $18, $18, $3C, $00	; (T)
+1222   12A4 18 18 3C 00 
+1223   12A8 C6 C6 C6 C6 Char_085		.db	$C6, $C6, $C6, $C6, $C6, $C6, $7C, $00	; (U)
+1223   12AC C6 C6 7C 00 
+1224   12B0 C6 C6 C6 C6 Char_086		.db	$C6, $C6, $C6, $C6, $C6, $6C, $38, $00	; (V)
+1224   12B4 C6 6C 38 00 
+1225   12B8 C6 C6 C6 C6 Char_087		.db	$C6, $C6, $C6, $C6, $D6, $EE, $C6, $00	; (W)
+1225   12BC D6 EE C6 00 
+1226   12C0 C6 6C 38 38 Char_088		.db	$C6, $6C, $38, $38, $38, $6C, $C6, $00	; (X)
+1226   12C4 38 6C C6 00 
+1227   12C8 66 66 66 3C Char_089		.db	$66, $66, $66, $3C, $18, $18, $3C, $00	; (Y)
+1227   12CC 18 18 3C 00 
+1228   12D0 FE C6 0C 18 Char_090		.db	$FE, $C6, $0C, $18, $30, $66, $FE, $00	; (Z)
+1228   12D4 30 66 FE 00 
+1229   12D8 1C 18 18 18 Char_091		.db	$1C, $18, $18, $18, $18, $18, $1C, $00	; ([)
+1229   12DC 18 18 1C 00 
+1230   12E0 C0 60 30 18 Char_092		.db	$C0, $60, $30, $18, $0C, $06, $02, $00	; (\)
+1230   12E4 0C 06 02 00 
+1231   12E8 70 30 30 30 Char_093		.db	$70, $30, $30, $30, $30, $30, $70, $00	; (])
+1231   12EC 30 30 70 00 
+1232   12F0 00 00 10 38 Char_094		.db	$00, $00, $10, $38, $6C, $C6, $00, $00	; (^)
+1232   12F4 6C C6 00 00 
+1233   12F8 00 00 00 00 Char_095		.db	$00, $00, $00, $00, $00, $00, $00, $FF	; (_)
+1233   12FC 00 00 00 FF 
+1234   1300 30 30 18 00 Char_096		.db	$30, $30, $18, $00, $00, $00, $00, $00	; (`)
+1234   1304 00 00 00 00 
+1235   1308 00 00 7C 06 Char_097		.db	$00, $00, $7C, $06, $7E, $C6, $7E, $00	; (a)
+1235   130C 7E C6 7E 00 
+1236   1310 C0 C0 FC C6 Char_098		.db	$C0, $C0, $FC, $C6, $C6, $C6, $FC, $00	; (b)
+1236   1314 C6 C6 FC 00 
+1237   1318 00 00 7C C6 Char_099		.db	$00, $00, $7C, $C6, $C0, $C6, $7C, $00	; (c)
+1237   131C C0 C6 7C 00 
+1238   1320 06 06 7E C6 Char_100		.db	$06, $06, $7E, $C6, $C6, $C6, $7E, $00	; (d)
+1238   1324 C6 C6 7E 00 
+1239   1328 00 00 7C C6 Char_101		.db	$00, $00, $7C, $C6, $FE, $C0, $7C, $00	; (e)
+1239   132C FE C0 7C 00 
+1240   1330 3C 66 60 F0 Char_102		.db	$3C, $66, $60, $F0, $60, $60, $60, $00	; (f)
+1240   1334 60 60 60 00 
+1241   1338 00 00 7E C6 Char_103		.db	$00, $00, $7E, $C6, $C6, $7E, $06, $7C	; (g)
+1241   133C C6 7E 06 7C 
+1242   1340 C0 C0 FC C6 Char_104		.db	$C0, $C0, $FC, $C6, $C6, $C6, $C6, $00	; (h)
+1242   1344 C6 C6 C6 00 
+1243   1348 18 00 38 18 Char_105		.db	$18, $00, $38, $18, $18, $18, $3C, $00	; (i)
+1243   134C 18 18 3C 00 
+1244   1350 00 0C 00 1C Char_106		.db	$00, $0C, $00, $1C, $0C, $0C, $CC, $78	; (j)
+1244   1354 0C 0C CC 78 
+1245   1358 C0 C0 C6 D8 Char_107		.db	$C0, $C0, $C6, $D8, $F0, $D8, $C6, $00	; (k)
+1245   135C F0 D8 C6 00 
+1246   1360 38 18 18 18 Char_108		.db	$38, $18, $18, $18, $18, $18, $3C, $00	; (l)
+1246   1364 18 18 3C 00 
+1247   1368 00 00 EE FE Char_109		.db	$00, $00, $EE, $FE, $D6, $C6, $C6, $00	; (m)
+1247   136C D6 C6 C6 00 
+1248   1370 00 00 FC C6 Char_110		.db	$00, $00, $FC, $C6, $C6, $C6, $C6, $00	; (n)
+1248   1374 C6 C6 C6 00 
+1249   1378 00 00 7C C6 Char_111		.db	$00, $00, $7C, $C6, $C6, $C6, $7C, $00	; (o)
+1249   137C C6 C6 7C 00 
+1250   1380 00 00 FC C6 Char_112		.db	$00, $00, $FC, $C6, $C6, $FC, $C0, $C0	; (p)
+1250   1384 C6 FC C0 C0 
+1251   1388 00 00 7E C6 Char_113		.db	$00, $00, $7E, $C6, $C6, $7E, $06, $06	; (q)
+1251   138C C6 7E 06 06 
+1252   1390 00 00 DE 76 Char_114		.db	$00, $00, $DE, $76, $60, $60, $60, $00	; (r)
+1252   1394 60 60 60 00 
+1253   1398 00 00 7C C0 Char_115		.db	$00, $00, $7C, $C0, $7C, $06, $7C, $00	; (s)
+1253   139C 7C 06 7C 00 
+1254   13A0 18 18 7E 18 Char_116		.db	$18, $18, $7E, $18, $18, $18, $1E, $00	; (t)
+1254   13A4 18 18 1E 00 
+1255   13A8 00 00 C6 C6 Char_117		.db	$00, $00, $C6, $C6, $C6, $C6, $7E, $00	; (u)
+1255   13AC C6 C6 7E 00 
+1256   13B0 00 00 C6 C6 Char_118		.db	$00, $00, $C6, $C6, $C6, $6C, $38, $00	; (v)
+1256   13B4 C6 6C 38 00 
+1257   13B8 00 00 C6 C6 Char_119		.db	$00, $00, $C6, $C6, $D6, $FE, $C6, $00	; (w)
+1257   13BC D6 FE C6 00 
+1258   13C0 00 00 C6 6C Char_120		.db	$00, $00, $C6, $6C, $38, $6C, $C6, $00	; (x)
+1258   13C4 38 6C C6 00 
+1259   13C8 00 00 C6 C6 Char_121		.db	$00, $00, $C6, $C6, $C6, $7E, $06, $7C	; (y)
+1259   13CC C6 7E 06 7C 
+1260   13D0 00 00 FE 0C Char_122		.db	$00, $00, $FE, $0C, $18, $60, $FE, $00	; (z)
+1260   13D4 18 60 FE 00 
+1261   13D8 0E 18 18 70 Char_123		.db	$0E, $18, $18, $70, $18, $18, $0E, $00	; ({)
+1261   13DC 18 18 0E 00 
+1262   13E0 18 18 18 00 Char_124		.db	$18, $18, $18, $00, $18, $18, $18, $00	; (|)
+1262   13E4 18 18 18 00 
+1263   13E8 E0 30 30 1C Char_125		.db	$E0, $30, $30, $1C, $30, $30, $E0, $00	; (})
+1263   13EC 30 30 E0 00 
+1264   13F0 00 00 70 9A Char_126		.db	$00, $00, $70, $9A, $0E, $00, $00, $00	; (~)
+1264   13F4 0E 00 00 00 
+1265   13F8 00 00 18 3C Char_127		.db	$00, $00, $18, $3C, $66, $FF, $00, $00	; (.)
+1265   13FC 66 FF 00 00 
+1266   1400 7C C6 C0 C0 Char_128		.db	$7C, $C6, $C0, $C0, $C6, $7C, $18, $70	; (.)
+1266   1404 C6 7C 18 70 
+1267   1408 66 00 C6 C6 Char_129		.db	$66, $00, $C6, $C6, $C6, $C6, $7E, $00	; (.)
+1267   140C C6 C6 7E 00 
+1268   1410 0E 18 7C C6 Char_130		.db	$0E, $18, $7C, $C6, $FE, $C0, $7C, $00	; (.)
+1268   1414 FE C0 7C 00 
+1269   1418 18 24 7C 06 Char_131		.db	$18, $24, $7C, $06, $7E, $C6, $7E, $00	; (.)
+1269   141C 7E C6 7E 00 
+1270   1420 66 00 7C 06 Char_132		.db	$66, $00, $7C, $06, $7E, $C6, $7E, $00	; (.)
+1270   1424 7E C6 7E 00 
+1271   1428 38 0C 7C 06 Char_133		.db	$38, $0C, $7C, $06, $7E, $C6, $7E, $00	; (.)
+1271   142C 7E C6 7E 00 
+1272   1430 18 00 7C 06 Char_134		.db	$18, $00, $7C, $06, $7E, $C6, $7E, $00	; (.)
+1272   1434 7E C6 7E 00 
+1273   1438 00 00 7C C0 Char_135		.db	$00, $00, $7C, $C0, $C0, $7C, $18, $70	; (.)
+1273   143C C0 7C 18 70 
+1274   1440 18 24 7C C6 Char_136		.db	$18, $24, $7C, $C6, $FE, $C0, $7C, $00	; (.)
+1274   1444 FE C0 7C 00 
+1275   1448 66 00 7C C6 Char_137		.db	$66, $00, $7C, $C6, $FE, $C0, $7C, $00	; (.)
+1275   144C FE C0 7C 00 
+1276   1450 70 18 7C C6 Char_138		.db	$70, $18, $7C, $C6, $FE, $C0, $7C, $00	; (.)
+1276   1454 FE C0 7C 00 
+1277   1458 66 00 38 18 Char_139		.db	$66, $00, $38, $18, $18, $18, $3C, $00	; (.)
+1277   145C 18 18 3C 00 
+1278   1460 18 24 38 18 Char_140		.db	$18, $24, $38, $18, $18, $18, $3C, $00	; (.)
+1278   1464 18 18 3C 00 
+1279   1468 38 0C 38 18 Char_141		.db	$38, $0C, $38, $18, $18, $18, $3C, $00	; (.)
+1279   146C 18 18 3C 00 
+1280   1470 66 00 7C C6 Char_142		.db	$66, $00, $7C, $C6, $FE, $C6, $C6, $00	; (.)
+1280   1474 FE C6 C6 00 
+1281   1478 18 00 7C C6 Char_143		.db	$18, $00, $7C, $C6, $FE, $C6, $C6, $00	; (.)
+1281   147C FE C6 C6 00 
+1282   1480 0E 18 FE 60 Char_144		.db	$0E, $18, $FE, $60, $78, $60, $FE, $00	; (.)
+1282   1484 78 60 FE 00 
+1283   1488 00 00 7C 1A Char_145		.db	$00, $00, $7C, $1A, $7E, $D8, $7E, $00	; (.)
+1283   148C 7E D8 7E 00 
+1284   1490 7E D8 D8 DE Char_146		.db	$7E, $D8, $D8, $DE, $F8, $D8, $DE, $00	; (.)
+1284   1494 F8 D8 DE 00 
+1285   1498 18 24 7C C6 Char_147		.db	$18, $24, $7C, $C6, $C6, $C6, $7C, $00	; (.)
+1285   149C C6 C6 7C 00 
+1286   14A0 66 00 7C C6 Char_148		.db	$66, $00, $7C, $C6, $C6, $C6, $7C, $00	; (.)
+1286   14A4 C6 C6 7C 00 
+1287   14A8 38 0C 7C C6 Char_149		.db	$38, $0C, $7C, $C6, $C6, $C6, $7C, $00	; (.)
+1287   14AC C6 C6 7C 00 
+1288   14B0 18 24 C6 C6 Char_150		.db	$18, $24, $C6, $C6, $C6, $C6, $7E, $00	; (.)
+1288   14B4 C6 C6 7E 00 
+1289   14B8 38 0C C6 C6 Char_151		.db	$38, $0C, $C6, $C6, $C6, $C6, $7E, $00	; (.)
+1289   14BC C6 C6 7E 00 
+1290   14C0 66 00 C6 C6 Char_152		.db	$66, $00, $C6, $C6, $C6, $7E, $06, $7C	; (.)
+1290   14C4 C6 7E 06 7C 
+1291   14C8 66 7C C6 C6 Char_153		.db	$66, $7C, $C6, $C6, $C6, $C6, $7C, $00	; (.)
+1291   14CC C6 C6 7C 00 
+1292   14D0 C6 00 C6 C6 Char_154		.db	$C6, $00, $C6, $C6, $C6, $C6, $7C, $00	; (.)
+1292   14D4 C6 C6 7C 00 
+1293   14D8 18 7C C6 C0 Char_155		.db	$18, $7C, $C6, $C0, $C6, $7C, $18, $00	; (.)
+1293   14DC C6 7C 18 00 
+1294   14E0 1E 32 30 78 Char_156		.db	$1E, $32, $30, $78, $30, $70, $FE, $00	; (.)
+1294   14E4 30 70 FE 00 
+1295   14E8 66 3C 18 7E Char_157		.db	$66, $3C, $18, $7E, $18, $3C, $18, $00	; (.)
+1295   14EC 18 3C 18 00 
+1296   14F0 FC C6 FC C0 Char_158		.db	$FC, $C6, $FC, $C0, $CC, $DE, $CC, $0E	; (.)
+1296   14F4 CC DE CC 0E 
+1297   14F8 00 1C 32 30 Char_159		.db	$00, $1C, $32, $30, $FC, $30, $F0, $00	; (.)
+1297   14FC FC 30 F0 00 
+1298   1500 0E 18 7C 06 Char_160		.db	$0E, $18, $7C, $06, $7E, $C6, $7E, $00	; (.)
+1298   1504 7E C6 7E 00 
+1299   1508 1A 30 38 18 Char_161		.db	$1A, $30, $38, $18, $18, $18, $3C, $00	; (.)
+1299   150C 18 18 3C 00 
+1300   1510 0E 18 7C C6 Char_162		.db	$0E, $18, $7C, $C6, $C6, $C6, $7C, $00	; (.)
+1300   1514 C6 C6 7C 00 
+1301   1518 0E 18 C6 C6 Char_163		.db	$0E, $18, $C6, $C6, $C6, $C6, $7E, $00	; (.)
+1301   151C C6 C6 7E 00 
+1302   1520 66 98 FC C6 Char_164		.db	$66, $98, $FC, $C6, $C6, $C6, $C6, $00	; (.)
+1302   1524 C6 C6 C6 00 
+1303   1528 66 98 E6 F6 Char_165		.db	$66, $98, $E6, $F6, $DE, $CE, $C6, $00	; (.)
+1303   152C DE CE C6 00 
+1304   1530 7C 06 7E C6 Char_166		.db	$7C, $06, $7E, $C6, $7E, $00, $FE, $00	; (.)
+1304   1534 7E 00 FE 00 
+1305   1538 7C C6 C6 C6 Char_167		.db	$7C, $C6, $C6, $C6, $7C, $00, $FE, $00	; (.)
+1305   153C 7C 00 FE 00 
+1306   1540 18 00 18 30 Char_168		.db	$18, $00, $18, $30, $60, $C6, $7C, $00	; (.)
+1306   1544 60 C6 7C 00 
+1307   1548 00 00 FE C0 Char_169		.db	$00, $00, $FE, $C0, $C0, $C0, $C0, $00	; (.)
+1307   154C C0 C0 C0 00 
+1308   1550 00 00 FE 06 Char_170		.db	$00, $00, $FE, $06, $06, $06, $06, $00	; (.)
+1308   1554 06 06 06 00 
+1309   1558 C0 C0 C0 DE Char_171		.db	$C0, $C0, $C0, $DE, $06, $0C, $1E, $00	; (.)
+1309   155C 06 0C 1E 00 
+1310   1560 C0 C0 C0 CC Char_172		.db	$C0, $C0, $C0, $CC, $1C, $3E, $0C, $00	; (.)
+1310   1564 1C 3E 0C 00 
+1311   1568 30 00 30 30 Char_173		.db	$30, $00, $30, $30, $30, $30, $30, $00	; (.)
+1311   156C 30 30 30 00 
+1312   1570 00 36 6C D8 Char_174		.db	$00, $36, $6C, $D8, $6C, $36, $00, $00	; (.)
+1312   1574 6C 36 00 00 
+1313   1578 00 D8 6C 36 Char_175		.db	$00, $D8, $6C, $36, $6C, $D8, $00, $00	; (.)
+1313   157C 6C D8 00 00 
+1314   1580 AA AA AA AA Char_176		.db	$AA, $AA, $AA, $AA, $AA, $AA, $AA, $AA	; (.)
+1314   1584 AA AA AA AA 
+1315   1588 AA 55 AA 55 Char_177		.db	$AA, $55, $AA, $55, $AA, $55, $AA, $55	; (.)
+1315   158C AA 55 AA 55 
+1316   1590 44 22 44 22 Char_178		.db	$44, $22, $44, $22, $44, $22, $44, $22	; (.)
+1316   1594 44 22 44 22 
+1317   1598 18 18 18 18 Char_179		.db	$18, $18, $18, $18, $18, $18, $18, $18	; (.)
+1317   159C 18 18 18 18 
+1318   15A0 18 18 18 F8 Char_180		.db	$18, $18, $18, $F8, $18, $18, $18, $18	; (.)
+1318   15A4 18 18 18 18 
+1319   15A8 18 18 18 F8 Char_181		.db	$18, $18, $18, $F8, $18, $F8, $18, $18	; (.)
+1319   15AC 18 F8 18 18 
+1320   15B0 36 36 36 F6 Char_182		.db	$36, $36, $36, $F6, $36, $36, $36, $36	; (.)
+1320   15B4 36 36 36 36 
+1321   15B8 00 00 00 FE Char_183		.db	$00, $00, $00, $FE, $36, $36, $36, $36	; (.)
+1321   15BC 36 36 36 36 
+1322   15C0 00 00 00 F8 Char_184		.db	$00, $00, $00, $F8, $18, $F8, $18, $18	; (.)
+1322   15C4 18 F8 18 18 
+1323   15C8 36 36 36 F6 Char_185		.db	$36, $36, $36, $F6, $06, $F6, $36, $36	; (.)
+1323   15CC 06 F6 36 36 
+1324   15D0 36 36 36 36 Char_186		.db	$36, $36, $36, $36, $36, $36, $36, $36	; (.)
+1324   15D4 36 36 36 36 
+1325   15D8 00 00 00 FE Char_187		.db	$00, $00, $00, $FE, $06, $F6, $36, $36	; (.)
+1325   15DC 06 F6 36 36 
+1326   15E0 36 36 36 F6 Char_188		.db	$36, $36, $36, $F6, $06, $FE, $00, $00	; (.)
+1326   15E4 06 FE 00 00 
+1327   15E8 36 36 36 FE Char_189		.db	$36, $36, $36, $FE, $00, $00, $00, $00	; (.)
+1327   15EC 00 00 00 00 
+1328   15F0 18 18 18 F8 Char_190		.db	$18, $18, $18, $F8, $18, $F8, $00, $00	; (.)
+1328   15F4 18 F8 00 00 
+1329   15F8 00 00 00 F8 Char_191		.db	$00, $00, $00, $F8, $18, $18, $18, $18	; (.)
+1329   15FC 18 18 18 18 
+1330   1600 18 18 18 1F Char_192		.db	$18, $18, $18, $1F, $00, $00, $00, $00	; (.)
+1330   1604 00 00 00 00 
+1331   1608 18 18 18 FF Char_193		.db	$18, $18, $18, $FF, $00, $00, $00, $00	; (.)
+1331   160C 00 00 00 00 
+1332   1610 00 00 00 FF Char_194		.db	$00, $00, $00, $FF, $18, $18, $18, $18	; (.)
+1332   1614 18 18 18 18 
+1333   1618 18 18 18 1F Char_195		.db	$18, $18, $18, $1F, $18, $18, $18, $18	; (.)
+1333   161C 18 18 18 18 
+1334   1620 00 00 00 FF Char_196		.db	$00, $00, $00, $FF, $00, $00, $00, $00	; (.)
+1334   1624 00 00 00 00 
+1335   1628 18 18 18 FF Char_197		.db	$18, $18, $18, $FF, $18, $18, $18, $18	; (.)
+1335   162C 18 18 18 18 
+1336   1630 18 18 18 1F Char_198		.db	$18, $18, $18, $1F, $18, $1F, $18, $18	; (.)
+1336   1634 18 1F 18 18 
+1337   1638 36 36 36 37 Char_199		.db	$36, $36, $36, $37, $36, $36, $36, $36	; (.)
+1337   163C 36 36 36 36 
+1338   1640 36 36 36 37 Char_200		.db	$36, $36, $36, $37, $30, $3F, $00, $00	; (.)
+1338   1644 30 3F 00 00 
+1339   1648 00 00 00 3F Char_201		.db	$00, $00, $00, $3F, $30, $37, $36, $36	; (.)
+1339   164C 30 37 36 36 
+1340   1650 36 36 36 F7 Char_202		.db	$36, $36, $36, $F7, $00, $FF, $00, $00	; (.)
+1340   1654 00 FF 00 00 
+1341   1658 00 00 00 FF Char_203		.db	$00, $00, $00, $FF, $00, $F7, $36, $36	; (.)
+1341   165C 00 F7 36 36 
+1342   1660 36 36 36 37 Char_204		.db	$36, $36, $36, $37, $30, $37, $36, $36	; (.)
+1342   1664 30 37 36 36 
+1343   1668 00 00 00 FF Char_205		.db	$00, $00, $00, $FF, $00, $FF, $00, $00	; (.)
+1343   166C 00 FF 00 00 
+1344   1670 36 36 36 F7 Char_206		.db	$36, $36, $36, $F7, $00, $F7, $36, $36	; (.)
+1344   1674 00 F7 36 36 
+1345   1678 18 18 18 FF Char_207		.db	$18, $18, $18, $FF, $00, $FF, $00, $00	; (.)
+1345   167C 00 FF 00 00 
+1346   1680 36 36 36 FF Char_208		.db	$36, $36, $36, $FF, $00, $00, $00, $00	; (.)
+1346   1684 00 00 00 00 
+1347   1688 00 00 00 FF Char_209		.db	$00, $00, $00, $FF, $00, $FF, $18, $18	; (.)
+1347   168C 00 FF 18 18 
+1348   1690 00 00 00 FF Char_210		.db	$00, $00, $00, $FF, $36, $36, $36, $36	; (.)
+1348   1694 36 36 36 36 
+1349   1698 36 36 36 3F Char_211		.db	$36, $36, $36, $3F, $00, $00, $00, $00	; (.)
+1349   169C 00 00 00 00 
+1350   16A0 18 18 18 1F Char_212		.db	$18, $18, $18, $1F, $18, $1F, $00, $00	; (.)
+1350   16A4 18 1F 00 00 
+1351   16A8 00 00 00 1F Char_213		.db	$00, $00, $00, $1F, $18, $1F, $18, $18	; (.)
+1351   16AC 18 1F 18 18 
+1352   16B0 00 00 00 3F Char_214		.db	$00, $00, $00, $3F, $36, $36, $36, $36	; (.)
+1352   16B4 36 36 36 36 
+1353   16B8 36 36 36 FF Char_215		.db	$36, $36, $36, $FF, $36, $36, $36, $36	; (.)
+1353   16BC 36 36 36 36 
+1354   16C0 18 18 18 FF Char_216		.db	$18, $18, $18, $FF, $18, $FF, $18, $18	; (.)
+1354   16C4 18 FF 18 18 
+1355   16C8 18 18 18 F8 Char_217		.db	$18, $18, $18, $F8, $00, $00, $00, $00	; (.)
+1355   16CC 00 00 00 00 
+1356   16D0 00 00 00 1F Char_218		.db	$00, $00, $00, $1F, $18, $18, $18, $18	; (.)
+1356   16D4 18 18 18 18 
+1357   16D8 FF FF FF FF Char_219		.db	$FF, $FF, $FF, $FF, $FF, $FF, $FF, $FF	; (.)
+1357   16DC FF FF FF FF 
+1358   16E0 00 00 00 00 Char_220		.db	$00, $00, $00, $00, $FF, $FF, $FF, $FF	; (.)
+1358   16E4 FF FF FF FF 
+1359   16E8 F0 F0 F0 F0 Char_221		.db	$F0, $F0, $F0, $F0, $F0, $F0, $F0, $F0	; (.)
+1359   16EC F0 F0 F0 F0 
+1360   16F0 0F 0F 0F 0F Char_222		.db	$0F, $0F, $0F, $0F, $0F, $0F, $0F, $0F	; (.)
+1360   16F4 0F 0F 0F 0F 
+1361   16F8 FF FF FF FF Char_223		.db	$FF, $FF, $FF, $FF, $00, $00, $00, $00	; (.)
+1361   16FC 00 00 00 00 
+1362   1700 00 00 77 98 Char_224		.db	$00, $00, $77, $98, $98, $77, $00, $00	; (.)
+1362   1704 98 77 00 00 
+1363   1708 1C 36 66 FC Char_225		.db	$1C, $36, $66, $FC, $C6, $C6, $FC, $C0	; (.)
+1363   170C C6 C6 FC C0 
+1364   1710 FE 62 60 60 Char_226		.db	$FE, $62, $60, $60, $60, $60, $60, $00	; (.)
+1364   1714 60 60 60 00 
+1365   1718 00 00 FF 66 Char_227		.db	$00, $00, $FF, $66, $66, $66, $66, $00	; (.)
+1365   171C 66 66 66 00 
+1366   1720 FE 62 30 18 Char_228		.db	$FE, $62, $30, $18, $30, $62, $FE, $00	; (.)
+1366   1724 30 62 FE 00 
+1367   1728 00 00 3F 66 Char_229		.db	$00, $00, $3F, $66, $C6, $CC, $78, $00	; (.)
+1367   172C C6 CC 78 00 
+1368   1730 00 00 33 33 Char_230		.db	$00, $00, $33, $33, $33, $3E, $30, $F0	; (.)
+1368   1734 33 3E 30 F0 
+1369   1738 00 00 FF 18 Char_231		.db	$00, $00, $FF, $18, $18, $18, $18, $00	; (.)
+1369   173C 18 18 18 00 
+1370   1740 3C 18 3C 66 Char_232		.db	$3C, $18, $3C, $66, $66, $3C, $18, $3C	; (.)
+1370   1744 66 3C 18 3C 
+1371   1748 00 7C C6 FE Char_233		.db	$00, $7C, $C6, $FE, $C6, $7C, $00, $00	; (.)
+1371   174C C6 7C 00 00 
+1372   1750 00 7E C3 C3 Char_234		.db	$00, $7E, $C3, $C3, $C3, $66, $E7, $00	; (.)
+1372   1754 C3 66 E7 00 
+1373   1758 1E 19 3C 66 Char_235		.db	$1E, $19, $3C, $66, $C6, $CC, $78, $00	; (.)
+1373   175C C6 CC 78 00 
+1374   1760 00 00 66 99 Char_236		.db	$00, $00, $66, $99, $99, $66, $00, $00	; (.)
+1374   1764 99 66 00 00 
+1375   1768 00 03 7C CE Char_237		.db	$00, $03, $7C, $CE, $E6, $7C, $C0, $00	; (.)
+1375   176C E6 7C C0 00 
+1376   1770 00 3E C0 FE Char_238		.db	$00, $3E, $C0, $FE, $C0, $3E, $00, $00	; (.)
+1376   1774 C0 3E 00 00 
+1377   1778 00 7E C3 C3 Char_239		.db	$00, $7E, $C3, $C3, $C3, $C3, $00, $00	; (.)
+1377   177C C3 C3 00 00 
+1378   1780 00 FE 00 FE Char_240		.db	$00, $FE, $00, $FE, $00, $FE, $00, $00	; (.)
+1378   1784 00 FE 00 00 
+1379   1788 18 18 7E 18 Char_241		.db	$18, $18, $7E, $18, $18, $7E, $00, $00	; (.)
+1379   178C 18 7E 00 00 
+1380   1790 70 18 0C 18 Char_242		.db	$70, $18, $0C, $18, $70, $00, $FE, $00	; (.)
+1380   1794 70 00 FE 00 
+1381   1798 1C 30 60 30 Char_243		.db	$1C, $30, $60, $30, $1C, $00, $FE, $00	; (.)
+1381   179C 1C 00 FE 00 
+1382   17A0 00 0E 1B 18 Char_244		.db	$00, $0E, $1B, $18, $18, $18, $18, $18	; (.)
+1382   17A4 18 18 18 18 
+1383   17A8 18 18 18 18 Char_245		.db	$18, $18, $18, $18, $18, $D8, $70, $00	; (.)
+1383   17AC 18 D8 70 00 
+1384   17B0 00 18 00 7E Char_246		.db	$00, $18, $00, $7E, $00, $18, $00, $00	; (.)
+1384   17B4 00 18 00 00 
+1385   17B8 00 76 DC 00 Char_247		.db	$00, $76, $DC, $00, $76, $DC, $00, $00	; (.)
+1385   17BC 76 DC 00 00 
+1386   17C0 3C 66 3C 00 Char_248		.db	$3C, $66, $3C, $00, $00, $00, $00, $00	; (.)
+1386   17C4 00 00 00 00 
+1387   17C8 00 18 3C 18 Char_249		.db	$00, $18, $3C, $18, $00, $00, $00, $00	; (.)
+1387   17CC 00 00 00 00 
+1388   17D0 00 00 00 00 Char_250		.db	$00, $00, $00, $00, $18, $00, $00, $00	; (.)
+1388   17D4 18 00 00 00 
+1389   17D8 0F 0C 0C 0C Char_251		.db	$0F, $0C, $0C, $0C, $EC, $6C, $38, $00	; (.)
+1389   17DC EC 6C 38 00 
+1390   17E0 D8 EC CC CC Char_252		.db	$D8, $EC, $CC, $CC, $00, $00, $00, $00	; (.)
+1390   17E4 00 00 00 00 
+1391   17E8 F0 30 C0 F0 Char_253		.db	$F0, $30, $C0, $F0, $00, $00, $00, $00	; (.)
+1391   17EC 00 00 00 00 
+1392   17F0 00 00 00 3C Char_254		.db	$00, $00, $00, $3C, $3C, $3C, $3C, $00	; (.)
+1392   17F4 3C 3C 3C 00 
+1393   17F8 00 00 00 00 Char_255		.db	$00, $00, $00, $00, $00, $00, $00, $00	; (.)
+1393   17FC 00 00 00 00 
+1394   1800             .endtasm: Number of errors = 0
