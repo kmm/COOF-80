@@ -35,7 +35,7 @@
 ;	0x07 - Delay number of loops specified by HL
 ;	0x08 - Get argbuf address and return it in HL
 ;	0x09 - Get rxbuf address and return it in HL
-;	0x0A - Get substring from argbuf
+;	0x0A - Get substring index in A from argbuf, return address in IX
 ; Calling convention:
 ; 	- Push call number on stack
 ;	- Load registers as appropriate for the API call being used
@@ -43,7 +43,7 @@
 
 ; UART Parameters
 BAUDRATE			.equ 9600					; console baud rate
-UARTCLK				.equ 4000000				; 16C550 crystal frequency
+UARTCLK				.equ 4000000				; 16C550 crystal frequency 4 MHz
 ; Program Constants
 STACKTOP			.equ 2040h 					; set stack pointer to 64 bytes above rom end
 RXBUFLEN			.equ 160
@@ -1108,7 +1108,7 @@ ansi_bg_white		.db 1Bh,"[47m",0
 crlf				.db "\r\n",0
 termbs				.db 08h,' ',08h,0
 hello				.db "COOFMON-Z80 ROM Monitor",0
-prompt				.db "coofmon> ",0
+prompt				.db "c00f> ",0
 toolong				.db "Input buffer overflow.",0
 err_bad_command		.db "ERR: Unknown command",0
 err_hexarg_ne		.db "ERR: Argument required",0
@@ -1133,7 +1133,7 @@ help				.db "COOFMON-Z80 Commands\r\n"
 					.db "	Read <hexport> and print the value (high order byte ignored)\r\n\r\n"
 					.db "o[utput] <hexport> <hexval>\r\n"
 					.db "	Write <hexval> to <hexport> (high order byte ignored)\r\n",0
-; Character pattern table for use with an LCD or similar.
+; Character pattern table for use with an LCD or similar. Unused, can be excluded.
 CHARTABLE:		.org $1000
 Char_000		.db	$00, $00, $00, $00, $00, $00, $00, $00	; (.)
 Char_001		.db	$7E, $81, $A5, $81, $BD, $99, $81, $7E	; (.)
