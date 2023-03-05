@@ -6,7 +6,7 @@
 ## Overview
 Designed and built from on-hand parts in early 2020, COOF-80 (stylized in hexadecimal compatible as C00F-80) is Z80 system implementation that would be relatively sophisticated if it was 1980. Unfortunately it is not 1980, so it's more of an example of the most basic level of computing and a fun toy model computer to play with. Includes a simple and probably buggy interactive ROM monitor.
 
-[![A complete C00F-80 System](system.jpg)]
+![A complete C00F-80 System](system.jpg)
 
 ## Specifications
 * Built using advanced perfboard technology
@@ -94,3 +94,7 @@ Calling convention:
 	- Load registers as appropriate for the API call being used
 	- Execute RST 08h
 ```
+
+## Other Stuff
+* ISA Bus
+	* I've attempted to interface an ISA MDA card with some degree of success. I can configure the CRTC and get it into a mode that can be fed into a VGA monitor, but memory writes to the framebuffer are unreliable and I'm not sure why. May revisit this eventually when I get a 16 bit Salae Logic and can better watch the bus. Source for configuring the CRTC is included in ASM/extra/mda.asm, and is intended to be pasted into the monitor using the Intel hex handler. Hardware for doing this is undocumented at the moment, but the short of it is most of the signals just need to be connected since ISA is basically an 8088 bus and the Z80 is fairly close to begin with being a conceptual relative of the 8080.
